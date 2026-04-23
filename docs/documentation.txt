@@ -1,0 +1,302 @@
+================================================================================
+DOCUMENTATION — Predictive Maintenance Audio CNN
+================================================================================
+This is a living document. Every function in the project is logged here with
+its location, signature, inputs/outputs, and a plain-English explanation.
+
+Last updated: 2026-04-23
+
+================================================================================
+FILE: src/preprocess.py
+PURPOSE: Convert raw .wav audio files into Log-Mel-Spectrograms saved as .npy
+================================================================================
+
+--------------------------------------------------------------------------------
+Function: load_and_normalize_audio
+Location: src/preprocess.py
+--------------------------------------------------------------------------------
+Signature:
+    load_and_normalize_audio(file_path, sample_rate=16000, target_length=160000)
+
+Inputs:
+    - file_path (str): Path to a .wav audio file on disk.
+    - sample_rate (int): Target sample rate in Hz. The audio will be resampled
+      to this rate regardless of the original recording rate. Default: 16000.
+    - target_length (int): The exact number of samples the output must contain.
+      Default: 160000 (which equals 10 seconds at 16 kHz).
+
+Output:
+    - audio (np.ndarray, shape: (target_length,)): A 1D float32 NumPy array
+      containing the audio waveform, guaranteed to be exactly target_length
+      samples long.
+
+Plain-English Summary:
+    This function reads a .wav file from disk using librosa, forces it to a
+    consistent sample rate (so all files are comparable), and then makes the
+    waveform a fixed length. If the clip is too long, it chops off the end.
+    If the clip is too short, it pads the end with silence (zeros). This is
+    necessary because our CNN requires every input to have the exact same
+    dimensions — you can't batch tensors of different shapes in PyTorch.
+
+--------------------------------------------------------------------------------
+Function: generate_log_mel_spectrogram
+Location: src/preprocess.py
+--------------------------------------------------------------------------------
+Signature:
+    generate_log_mel_spectrogram(audio, sample_rate=16000, n_fft=2048,
+                                  hop_length=512, n_mels=128)
+
+Inputs:
+    - audio (np.ndarray, shape: (n_samples,)): A 1D array of audio samples,
+      typically the output of load_and_normalize_audio().
+    - sample_rate (int): Sample rate of the audio in Hz. Default: 16000.
+    - n_fft (int): Size of the FFT window. Larger values give better frequency
+      resolution but worse time resolution. Default: 2048.
+    - hop_length (int): Number of samples between successive FFT windows (the
+      stride). Smaller values give more time frames. Default: 512.
+    - n_mels (int): Number of Mel-frequency bands (the height of the output
+      matrix). Default: 128.
+
+Output:
+    - log_mel_spec (np.ndarray, shape: (n_mels, n_time_frames)): A 2D matrix
+      representing the Log-Mel-Spectrogram in decibels. With defaults and 10s
+      of audio, the shape is approximately (128, 313).
+
+Plain-English Summary:
+    This is the core transformation function. It takes a 1D audio waveform and
+    turns it into a 2D "image" that the CNN can learn from. First, it computes
+    a Mel-scaled spectrogram using librosa (which internally runs a Short-Time
+    Fourier Transform and applies triangular Mel filterbanks). Then it converts
+    the raw power values to decibels (log scale) so the dynamic range is
+    compressed and the CNN can learn from both quiet and loud parts of the
+    signal equally. The reference for dB conversion is the max value in the
+    spectrogram, so the loudest point becomes 0 dB.
+
+--------------------------------------------------------------------------------
+Function: process_class_directory
+Location: src/preprocess.py
+--------------------------------------------------------------------------------
+Signature:
+    process_class_directory(class_label, raw_dir="data/raw",
+                            processed_dir="data/processed")
+
+Inputs:
+    - class_label (str): Name of the class subfolder, e.g. "normal" or
+      "abnormal". Determines both the input path (raw_dir/class_label/) and
+      the output path (processed_dir/class_label/).
+    - raw_dir (str): Path to the parent directory containing raw .wav files.
+      Default: "data/raw".
+    - processed_dir (str): Path to the parent directory where .npy outputs
+      will be saved. Default: "data/processed".
+
+Output:
+    - processed_count (int): The number of .wav files that were successfully
+      converted and saved as .npy files.
+
+Plain-English Summary:
+    This function handles one entire class (e.g., all "normal" audio files).
+    It finds every .wav file in the class's raw folder, runs each through the
+    load → spectrogram → save pipeline, and writes the resulting .npy files
+    into the matching processed folder. It creates the output directory if it
+    doesn't exist, prints progress updates every 50 files, and gracefully
+    handles errors on individual files without crashing the whole batch.
+
+--------------------------------------------------------------------------------
+Function: run_preprocessing_pipeline
+Location: src/preprocess.py
+--------------------------------------------------------------------------------
+Signature:
+    run_preprocessing_pipeline()
+
+Inputs:
+    - None. Reads from the module-level configuration constants (SAMPLE_RATE,
+      TARGET_DURATION_SEC, N_FFT, HOP_LENGTH, N_MELS, RAW_DATA_DIR,
+      PROCESSED_DATA_DIR, CLASS_LABELS).
+
+Output:
+    - None. Side effects: writes .npy files to disk and prints a summary to
+      the console.
+
+Plain-English Summary:
+    This is the top-level orchestrator. When you run `python src/preprocess.py`,
+    this function is what executes. It prints the current configuration (so you
+    can verify your settings), then loops over each class label ("normal",
+    "abnormal") and calls process_class_directory() for each one. After all
+    classes are processed, it prints a final summary showing how many total
+    spectrograms were created and what their expected shape is.
+
+
+================================================================================
+FILE: src/dataset.py
+PURPOSE: PyTorch data pipeline — file discovery, stratified split, class
+         weights, lazy-loading Dataset, and DataLoader factory
+================================================================================
+
+--------------------------------------------------------------------------------
+Function: gather_file_paths_and_labels
+Location: src/dataset.py
+--------------------------------------------------------------------------------
+Signature:
+    gather_file_paths_and_labels(processed_dir="data/processed",
+                                  class_labels=["normal", "abnormal"])
+
+Inputs:
+    - processed_dir (str): Parent directory containing per-class subfolders of
+      .npy spectrogram files. Default: "data/processed".
+    - class_labels (list of str): Ordered list of class subfolder names. The
+      index of each name becomes that class's integer label — so "normal"
+      (index 0) → label 0 and "abnormal" (index 1) → label 1.
+
+Outputs:
+    - file_paths (list of str): Paths to every discovered .npy file across all
+      classes.
+    - labels (list of int): Integer labels corresponding 1:1 with file_paths.
+
+Plain-English Summary:
+    This function walks the data/processed/ directory, finds every .npy file
+    inside the "normal" and "abnormal" subfolders, and builds two parallel
+    lists — one of file paths and one of the matching integer class labels.
+    The paths are sorted alphabetically for deterministic ordering, which
+    ensures the downstream random split is reproducible across runs. This is
+    the "discovery" step that feeds every later stage of the pipeline.
+
+--------------------------------------------------------------------------------
+Function: stratified_split
+Location: src/dataset.py
+--------------------------------------------------------------------------------
+Signature:
+    stratified_split(file_paths, labels, train_ratio=0.70,
+                     val_ratio=0.15, test_ratio=0.15, random_seed=42)
+
+Inputs:
+    - file_paths (list of str): All .npy file paths from
+      gather_file_paths_and_labels().
+    - labels (list of int): Corresponding integer labels.
+    - train_ratio (float): Fraction of data assigned to training. Default 0.70.
+    - val_ratio (float): Fraction assigned to validation. Default 0.15.
+    - test_ratio (float): Fraction assigned to testing. Default 0.15.
+    - random_seed (int): Seed for sklearn's RNG so the split is reproducible.
+      Default: 42.
+
+Output:
+    - splits (dict): A dictionary with six keys: "train_paths", "train_labels",
+      "val_paths", "val_labels", "test_paths", "test_labels". Each value is a
+      list of the same length within its own split.
+
+Plain-English Summary:
+    This function divides the dataset into three subsets — training (70%),
+    validation (15%), and testing (15%) — while making sure that the ratio of
+    normal-to-abnormal files is preserved in every subset (this is what
+    "stratified" means). Because sklearn's train_test_split only does a
+    two-way split, we call it twice: once to split off the 70% training set,
+    then again to split the remaining 30% evenly into val and test. We pass
+    stratify=labels both times so each split is a representative miniature of
+    the whole dataset — preventing the disaster of accidentally getting zero
+    abnormal samples in the test set.
+
+--------------------------------------------------------------------------------
+Function: compute_class_weights
+Location: src/dataset.py
+--------------------------------------------------------------------------------
+Signature:
+    compute_class_weights(train_labels, num_classes=2)
+
+Inputs:
+    - train_labels (list of int): Integer labels for the TRAINING SET ONLY.
+      We deliberately exclude val/test labels to avoid leaking information
+      about the held-out class distributions into training.
+    - num_classes (int): Total number of classes. Default: 2 (binary).
+
+Output:
+    - class_weights (np.ndarray, shape: (num_classes,), dtype float32): A 1D
+      array where class_weights[c] is the weight for class c. Meant to be
+      passed to torch.nn.CrossEntropyLoss(weight=...).
+
+Plain-English Summary:
+    This function compensates for class imbalance. The MIMII dataset typically
+    has far more "normal" recordings than "abnormal" ones, so without any
+    correction the CNN could achieve high accuracy by simply always predicting
+    "normal" — useless for anomaly detection. We use the inverse-frequency
+    formula: weight[c] = N_total / (num_classes * N_c). This makes rare classes
+    get larger weights, so mistakes on them cost the model more during training.
+    For example, if there are 900 normal and 100 abnormal training samples, the
+    abnormal class gets roughly 9x the weight of the normal class. These
+    weights plug directly into PyTorch's CrossEntropyLoss.
+
+--------------------------------------------------------------------------------
+Class: SpectrogramDataset
+Location: src/dataset.py
+--------------------------------------------------------------------------------
+Signature:
+    SpectrogramDataset(file_paths, labels)
+    Methods: __init__, __len__, __getitem__
+
+Constructor Inputs:
+    - file_paths (list of str): Paths to .npy spectrogram files for this split.
+    - labels (list of int): Integer class labels, parallel to file_paths.
+
+__getitem__ Output:
+    - spectrogram (torch.FloatTensor, shape: (1, n_mels, n_time_frames)):
+      The Log-Mel-Spectrogram with an explicit channel dimension inserted at
+      position 0. With our defaults: shape (1, 128, 313), dtype float32.
+    - label (torch.LongTensor, scalar): The integer class label (0 or 1) as
+      int64 (required by CrossEntropyLoss).
+
+__len__ Output:
+    - int: Number of samples in this dataset (length of file_paths).
+
+Plain-English Summary:
+    This is our custom PyTorch Dataset — the object PyTorch's DataLoader pulls
+    samples from during training. The key design choice is LAZY LOADING: the
+    constructor only stores the file paths (a few KB), not the spectrograms
+    themselves. Each .npy file is read from disk one at a time inside
+    __getitem__ when the DataLoader asks for a specific sample. This keeps
+    memory usage flat regardless of how large the dataset grows — essential
+    for running on Colab's limited free-tier RAM.
+
+    Inside __getitem__ we also handle two PyTorch-specific conversions:
+      1. NumPy array → torch.float32 tensor (models expect float32, not float64).
+      2. Add a channel dimension with .unsqueeze(0), transforming
+         shape (n_mels, n_time) into (1, n_mels, n_time). This is required
+         because nn.Conv2d layers expect 4D input [batch, channels, H, W], and
+         our spectrogram is effectively a grayscale "image" with one channel.
+    Labels are wrapped in torch.long tensors because CrossEntropyLoss requires
+    integer class indices, not floats.
+
+--------------------------------------------------------------------------------
+Function: get_dataloaders
+Location: src/dataset.py
+--------------------------------------------------------------------------------
+Signature:
+    get_dataloaders(processed_dir="data/processed", batch_size=32,
+                    num_workers=0, random_seed=42)
+
+Inputs:
+    - processed_dir (str): Parent directory of processed .npy files.
+      Default: "data/processed".
+    - batch_size (int): Number of samples per mini-batch. Default: 32.
+    - num_workers (int): Number of subprocess workers for parallel data
+      loading. Default: 0 (safe on Windows; raise to 2–4 on Linux/Colab for
+      faster I/O).
+    - random_seed (int): Seed for reproducible splitting. Default: 42.
+
+Outputs:
+    - train_loader (DataLoader): Shuffled, batched iterator over the training
+      split. Used during the fitting loop.
+    - val_loader (DataLoader): Un-shuffled iterator over the validation split.
+      Used to monitor overfitting and tune hyperparameters.
+    - test_loader (DataLoader): Un-shuffled iterator over the held-out test
+      split. Only used ONCE at the very end for final reported metrics.
+    - class_weights (np.ndarray, shape: (2,)): Inverse-frequency class weights
+      computed from the training set, ready to feed into CrossEntropyLoss.
+
+Plain-English Summary:
+    This is the one-call entry point for the entire data pipeline. It runs the
+    full sequence end-to-end: discover all .npy files, stratify-split them
+    into train/val/test, compute class weights from training labels only,
+    wrap each split in a SpectrogramDataset, and finally wrap each Dataset
+    in a PyTorch DataLoader with the right settings — shuffle=True only for
+    training, pin_memory=True for faster GPU transfers. In the training
+    script you just call this once and you're ready to iterate. Returns
+    everything the training loop needs: three loaders and the class weights
+    array for the weighted loss function.
