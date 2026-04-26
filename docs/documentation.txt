@@ -664,43 +664,60 @@ Outputs:
     - y_true (np.ndarray, shape (N,)): Integer ground-truth labels for
       every test sample.
     - y_pred (np.ndarray, shape (N,)): Integer predicted labels (argmax
-      over the model's 2 logits).
+      over the model's 2 logits — equivalent to thresholding the
+      positive-class probability at 0.5).
+    - y_probs (np.ndarray, shape (N,)): Predicted probability of the
+      POSITIVE (abnormal) class for every sample, in [0, 1]. Required for
+      ROC-AUC and any threshold-sweep analysis.
 
 Plain-English Summary:
     Loops once over the test DataLoader inside torch.no_grad() (no autograd
     overhead — we're not training), runs the forward pass on each batch,
-    takes argmax to convert logits into hard class predictions, and pulls
-    the results back to the CPU as Python lists. Concatenates everything
-    into two parallel NumPy arrays at the end so they're ready for sklearn's
-    metrics functions, which only accept array-like inputs.
+    and produces three things per sample: the ground-truth label, the hard
+    argmax prediction, and the soft positive-class probability obtained by
+    applying torch.softmax(logits, dim=1) and slicing column [:, 1]. The
+    soft probabilities are necessary because ROC-AUC and the ROC curve
+    work in probability space — they sweep a threshold across the positive-
+    class score, which only exists if we softmax the raw logits first
+    (the model's forward() deliberately omits softmax so CrossEntropyLoss
+    can apply log-softmax internally during training). Pulls everything
+    back to the CPU and returns three parallel NumPy arrays ready for
+    sklearn's metrics functions.
 
 --------------------------------------------------------------------------------
 Function: compute_and_print_metrics
 Location: src/evaluate.py
 --------------------------------------------------------------------------------
 Signature:
-    compute_and_print_metrics(y_true, y_pred, positive_label=1)
+    compute_and_print_metrics(y_true, y_pred, y_probs, positive_label=1)
 
 Inputs:
     - y_true (np.ndarray): Ground-truth labels.
-    - y_pred (np.ndarray): Predicted labels.
+    - y_pred (np.ndarray): Predicted labels (argmax over logits — fixed
+      0.5 threshold).
+    - y_probs (np.ndarray): Positive-class probabilities, in [0, 1].
+      Used for the threshold-independent ROC-AUC.
     - positive_label (int): Which class counts as "positive" for the binary
       precision/recall/F1 calculations. Default: 1 (abnormal).
 
 Output:
-    - metrics (dict): {"accuracy", "precision", "recall", "f1"} — returned
-      so callers can log the numbers without recomputing them.
+    - metrics (dict): {"accuracy", "precision", "recall", "f1", "roc_auc"}
+      — returned so callers can log the numbers without recomputing them.
 
 Plain-English Summary:
-    Computes and pretty-prints the four headline test-set metrics:
-    Accuracy, Precision, Recall, and F1-Score. All three of the binary
-    metrics target the abnormal class (pos_label=1) because that's the
-    event predictive maintenance actually cares about. zero_division=0
-    is passed everywhere so a model that produces no positive predictions
-    scores 0.0 cleanly instead of triggering NaN or a runtime warning.
-    The print block also includes a one-line reminder that RECALL is the
-    most important metric in this domain — a missed abnormal sample
-    means a real machine fault going undetected.
+    Computes and pretty-prints the FIVE headline test-set metrics:
+    Accuracy, Precision, Recall, F1-Score, and ROC-AUC. The first four
+    are computed from the hard argmax predictions and target the abnormal
+    class (pos_label=1, zero_division=0) — they describe model performance
+    at the default 0.5 decision threshold. ROC-AUC is computed from the
+    soft positive-class probabilities via roc_auc_score(y_true, y_probs)
+    and is threshold-independent: it answers "if I rank every test sample
+    by the model's abnormal-probability, how well does that ranking
+    separate true abnormals from true normals?" AUC = 1.0 is perfect,
+    AUC = 0.5 is no better than random. The print block also reminds the
+    reader that recall is the most operationally important metric for
+    predictive maintenance, and that AUC matters because real-world
+    deployments often need to retune the alarm threshold after training.
 
 --------------------------------------------------------------------------------
 Function: plot_and_save_confusion_matrix
@@ -738,6 +755,46 @@ Plain-English Summary:
     that means a real anomaly slipped through.
 
 --------------------------------------------------------------------------------
+Function: plot_and_save_roc_curve
+Location: src/evaluate.py
+--------------------------------------------------------------------------------
+Signature:
+    plot_and_save_roc_curve(y_true, y_probs, output_path=ROC_CURVE_PATH)
+
+Inputs:
+    - y_true (np.ndarray): Ground-truth binary labels (0 = normal, 1 = abnormal).
+    - y_probs (np.ndarray): Predicted probability of the POSITIVE (abnormal)
+      class for every sample. NOT hard predictions — sklearn needs continuous
+      scores so it can sweep the decision threshold.
+    - output_path (str): Where to save the PNG. Parent directory is
+      created on demand. Default: docs/visualizations/roc_curve.png.
+
+Output:
+    - roc_auc (float): The computed Area Under the ROC Curve. Returned
+      for programmatic use; also printed and embedded in the saved
+      figure's legend.
+
+Plain-English Summary:
+    Calls sklearn.metrics.roc_curve to get the (FPR, TPR) coordinates the
+    model produces as the decision threshold sweeps from 1.0 down to 0.0,
+    then renders them as a matplotlib line plot annotated with both the
+    AUC value (in the legend) and a dashed gray diagonal showing the
+    random-classifier baseline. Saves the figure as a 150-dpi PNG to
+    docs/visualizations/ for the final report.
+
+    The ROC curve is the right evaluation tool for imbalanced predictive
+    maintenance because the default 0.5 argmax threshold is rarely the
+    right operational choice. If missing a fault is catastrophic, the
+    operator wants to LOWER the threshold to flag more samples as abnormal
+    (raising recall at the cost of more false alarms); if false alarms
+    are extremely expensive, they want to RAISE the threshold so only
+    the most confident predictions trigger. The ROC curve plots the
+    entire trade-off explicitly, and AUC summarizes the curve in one
+    threshold-independent number — the most honest single-number quality
+    summary on imbalanced data, since it doesn't depend on where the
+    final alarm threshold ends up being set.
+
+--------------------------------------------------------------------------------
 Function: main
 Location: src/evaluate.py
 --------------------------------------------------------------------------------
@@ -759,8 +816,240 @@ Plain-English Summary:
     from the project root. Picks a device, builds the test DataLoader
     (deliberately discarding the train and val loaders so test-time
     information can't leak back into training decisions), loads the best
-    checkpoint via load_trained_model, runs run_inference to collect all
-    predictions, and finally calls compute_and_print_metrics and
-    plot_and_save_confusion_matrix. This is the script we run ONCE at
-    the very end of the project to produce the numbers and figure that
-    go into the final report.
+    checkpoint via load_trained_model, and runs run_inference to collect
+    three parallel arrays — true labels, hard argmax predictions, and
+    soft positive-class probabilities. Then it calls
+    compute_and_print_metrics (which now reports five metrics including
+    threshold-independent ROC-AUC), plot_and_save_confusion_matrix
+    (heatmap PNG), and plot_and_save_roc_curve (ROC + diagonal baseline
+    PNG). This is the script we run ONCE at the very end of the project
+    to produce the numbers and the two figures that go into the final
+    report.
+
+
+================================================================================
+FILE: src/explain.py
+PURPOSE: Grad-CAM explainability. Loads the best checkpoint, runs Gradient-
+         weighted Class Activation Mapping on one Normal and one Abnormal
+         test sample, and saves side-by-side spectrogram + heatmap PNGs to
+         docs/visualizations/ to show WHY the model classifies the way it does.
+================================================================================
+
+WHY GRAD-CAM FOR THIS PROJECT?
+    Quantitative metrics (Accuracy, F1, ROC-AUC from evaluate.py) tell us
+    IF the CNN is performing well. They cannot tell us WHY. For a real
+    predictive-maintenance deployment, an engineer needs to see the model's
+    reasoning before sending a maintenance crew or shutting down a line.
+
+    Grad-CAM (Selvaraju et al., 2017) opens the black box. It traces the
+    gradient of the predicted class's logit BACKWARD through the network
+    to the activations of the last convolutional layer, computes a per-
+    channel importance weight from those gradients, and combines the
+    channels into a single 2D heatmap that shows exactly which time/
+    frequency regions of the input spectrogram drove the decision. The
+    heatmap is then upsampled back to the original (128, 313) spectrogram
+    size and overlaid translucently — a domain expert can see at a glance
+    whether the model latched onto physically meaningful features (e.g.
+    high-frequency harmonics typical of bearing faults) or onto spurious
+    artifacts (e.g. clip onset, mic placement noise). This is the
+    qualitative evidence a final report needs to argue the model is
+    trustworthy, not just statistically accurate.
+
+WHY THE LAST CONV LAYER (model.get_final_conv_layer() → self.conv4)?
+    The deepest conv layer is the deepest layer that still has spatial
+    structure — fully-connected layers below it have already collapsed
+    height and width into a flat vector, destroying the "where in the
+    spectrogram?" information Grad-CAM needs. The last conv layer also
+    sees the most semantically rich features (the actual "this looks
+    like an abnormal squeal" detector), so its heatmap is both spatial
+    and class-discriminative. AudioClassifier exposes self.conv4 as a
+    named attribute precisely so this script has a stable hook target.
+
+--------------------------------------------------------------------------------
+Function: load_model_for_explain
+Location: src/explain.py
+--------------------------------------------------------------------------------
+Signature:
+    load_model_for_explain(device, checkpoint_path=CHECKPOINT_PATH,
+                           base_filters=BASE_FILTERS)
+
+Inputs:
+    - device (torch.device): Where the model should live (cuda / mps / cpu).
+    - checkpoint_path (str): Path to the .pth file saved by train.py.
+      Default: train.py's CHECKPOINT_PATH (models/best_model.pth).
+    - base_filters (int): Conv-stack width. MUST equal the value used at
+      training time, otherwise the saved state_dict won't fit the rebuilt
+      architecture. Default: train.py's BASE_FILTERS.
+
+Output:
+    - model (AudioClassifier): Architecture rebuilt, weights loaded from
+      disk, moved to `device`, and switched into eval() mode (Dropout off,
+      BatchNorm using running statistics). Autograd is left ENABLED —
+      Grad-CAM requires backward passes to compute gradients on the
+      target conv layer.
+
+Plain-English Summary:
+    Helper that handles the three steps of "load a trained model for
+    explanation": build a fresh AudioClassifier with the same
+    hyperparameters as training, load the saved state_dict from disk
+    (using map_location=device for safe cross-device transfer), and put
+    the model into eval mode. Crucially, we do NOT wrap subsequent
+    forward passes in torch.no_grad() the way evaluate.py does — Grad-CAM
+    needs gradients to flow, and disabling autograd would silently break
+    the algorithm. Raises a clear FileNotFoundError if the checkpoint is
+    missing — usually meaning the user ran explain.py before train.py.
+
+--------------------------------------------------------------------------------
+Function: find_one_per_class
+Location: src/explain.py
+--------------------------------------------------------------------------------
+Signature:
+    find_one_per_class(test_loader)
+
+Inputs:
+    - test_loader (DataLoader): The TEST DataLoader from get_dataloaders().
+      Un-shuffled but that doesn't matter here — we just need one of each
+      class, not a representative pair.
+
+Outputs:
+    - normal_spec   (torch.Tensor, shape (1, 1, 128, 313)): One Normal
+      (label 0) test spectrogram with the batch dim already added.
+    - abnormal_spec (torch.Tensor, shape (1, 1, 128, 313)): One Abnormal
+      (label 1) test spectrogram, same shape conventions.
+
+Plain-English Summary:
+    Walks through the test DataLoader and returns the FIRST sample it
+    encounters of each class, then exits early. We deliberately scan the
+    test set (not train/val) because explanations should illustrate model
+    behavior on data the model has NEVER seen — using training samples
+    would bias the heatmaps toward memorized patterns instead of
+    generalized ones. The function unpacks each batch sample-by-sample
+    and stops as soon as both buckets are filled (most batches contain
+    both classes, so this typically completes in the very first batch).
+    Raises RuntimeError if the loader is exhausted before both classes
+    are found, which usually indicates an empty class folder upstream.
+
+--------------------------------------------------------------------------------
+Function: generate_gradcam
+Location: src/explain.py
+--------------------------------------------------------------------------------
+Signature:
+    generate_gradcam(model, target_layers, spectrogram, target_class, device)
+
+Inputs:
+    - model (AudioClassifier): Trained model in eval() mode on `device`.
+    - target_layers (list of nn.Module): Conv layers Grad-CAM should hook
+      into. For our architecture: [model.get_final_conv_layer()].
+    - spectrogram (torch.Tensor, shape (1, 1, 128, 313)): A single
+      spectrogram with the batch dimension already added.
+    - target_class (int): Which class's logit to back-prop from.
+      0 = Normal, 1 = Abnormal. We pass the GROUND TRUTH label so the
+      heatmap visualizes "why this sample looks like {actual class}"
+      rather than echoing whatever the model happened to predict.
+    - device (torch.device): Compute device.
+
+Outputs:
+    - spec_2d (np.ndarray, shape (128, 313)): The original spectrogram as
+      a plain 2D NumPy array (channel/batch dims stripped) — used as the
+      background image for the overlay plot.
+    - heatmap (np.ndarray, shape (128, 313), values in [0, 1]): The
+      Grad-CAM saliency map, already bilinearly upsampled to the input
+      spectrogram's size and min-max normalized by the library.
+
+Plain-English Summary:
+    This is where the actual Grad-CAM math happens, all wrapped behind
+    pytorch_grad_cam's GradCAM class. Three setup details matter:
+      1. We call .requires_grad_(True) on the input tensor — Grad-CAM
+         requires autograd to capture gradients on the target layer.
+      2. We create the GradCAM object inside a `with` block so its forward
+         and backward hooks are guaranteed to be removed afterwards (a
+         leaked hook would corrupt every subsequent forward pass and leak
+         memory).
+      3. We pass [ClassifierOutputTarget(target_class)] as the targets,
+         which tells the library exactly which logit to back-prop from
+         instead of defaulting to argmax.
+    Internally the library forwards the input, captures activations on
+    the conv4 layer, scalar-sums the chosen logits, back-props to capture
+    gradients, spatially-averages those gradients into per-channel
+    weights, weighted-sums the activations, ReLUs the result, bilinearly
+    upsamples from (8, 19) → (128, 313), and min-max normalizes to [0, 1].
+    Returns the raw 2D spectrogram alongside the (H, W) heatmap so the
+    plotting helper has everything it needs in one call.
+
+--------------------------------------------------------------------------------
+Function: plot_and_save_explanation
+Location: src/explain.py
+--------------------------------------------------------------------------------
+Signature:
+    plot_and_save_explanation(spec_2d, heatmap, class_name, output_path)
+
+Inputs:
+    - spec_2d (np.ndarray, shape (128, 313)): The standardized spectrogram
+      (already mean/std-normalized inside SpectrogramDataset). Re-normalized
+      to [0, 1] inside this function purely for display contrast.
+    - heatmap (np.ndarray, shape (128, 313), values in [0, 1]): Grad-CAM
+      saliency map from generate_gradcam().
+    - class_name (str): "Normal" or "Abnormal" — used in the figure
+      title and subplot titles.
+    - output_path (str): Where to save the PNG. Parent directory is
+      created on demand with exist_ok=True.
+
+Output:
+    - None. Side effects: writes a 150-DPI PNG to output_path and prints
+      a confirmation line.
+
+Plain-English Summary:
+    Renders a single Matplotlib figure with two subplots side-by-side:
+    the original Mel-spectrogram on the left (viridis colormap, low
+    frequencies at the bottom following the audio convention), and the
+    same spectrogram with the Grad-CAM heatmap overlaid on the right
+    (jet colormap blended translucently over a grayscale-RGB version of
+    the spectrogram via show_cam_on_image). Side-by-side is deliberate:
+    the eye can compare "what's there" against "what the model looked
+    at" in one glance, which is exactly the comparison a domain expert
+    needs to validate the model's reasoning. Saves at 150 DPI to match
+    the resolution of evaluate.py's confusion-matrix and ROC-curve
+    figures so all report visuals look consistent. Closes the figure
+    with plt.close to release matplotlib's internal references.
+
+--------------------------------------------------------------------------------
+Function: main
+Location: src/explain.py
+--------------------------------------------------------------------------------
+Signature:
+    main()
+
+Inputs:
+    - None. Reuses BASE_FILTERS, CHECKPOINT_PATH, and get_device imported
+      from src/train.py to keep explanation in lock-step with training.
+
+Output:
+    - None. Side effects: writes
+        docs/visualizations/gradcam_normal.png
+        docs/visualizations/gradcam_abnormal.png
+      and prints a per-step progress log.
+
+Plain-English Summary:
+    The orchestrator that runs when you launch `python src/explain.py`
+    from the project root. It does the full job in five steps:
+      1. Pick a device (CUDA / MPS / CPU) via train.py's helper.
+      2. Load the trained AudioClassifier from models/best_model.pth and
+         grab the Grad-CAM target layer via model.get_final_conv_layer().
+      3. Build the test DataLoader (deliberately discarding the train/val
+         loaders — explanation should never look at training data) and
+         find one Normal and one Abnormal sample with find_one_per_class.
+      4. Run generate_gradcam on the Normal sample with target_class=0
+         (back-prop from the "Normal" logit) and save the side-by-side
+         comparison PNG.
+      5. Run generate_gradcam on the Abnormal sample with target_class=1
+         (back-prop from the "Abnormal" logit) and save the second PNG.
+    These two images are the qualitative evidence that ships alongside
+    evaluate.py's quantitative metrics in the final report — together
+    they answer both "is the model accurate?" and "is the model
+    accurate for the right reasons?"
+
+USAGE:
+    From the project root, AFTER training (so models/best_model.pth exists):
+        python src/explain.py
+    Requires the third-party `pytorch-grad-cam` package:
+        pip install grad-cam

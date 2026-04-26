@@ -67,6 +67,9 @@ from sklearn.metrics import (
     recall_score,      # TP / (TP + FN) for the chosen class
     f1_score,          # Harmonic mean of precision and recall
     confusion_matrix,  # Raw 2x2 (or NxN) count grid
+    roc_curve,         # (FPR, TPR, thresholds) sweep across all decision thresholds
+    auc,               # Area-under-curve given (x, y) — used with roc_curve outputs
+    roc_auc_score,     # Convenience: ROC-AUC directly from (y_true, y_probs)
 )
 
 # --- Make `from src.xxx import ...` work when running this file directly. ---
@@ -108,6 +111,11 @@ VISUALIZATION_DIR = os.path.join(PROJECT_ROOT, "docs", "visualizations")
 
 CONFUSION_MATRIX_PATH = os.path.join(VISUALIZATION_DIR, "confusion_matrix.png")
 # Output path for the heatmap PNG. Overwritten every time evaluate.py runs.
+
+ROC_CURVE_PATH = os.path.join(VISUALIZATION_DIR, "roc_curve.png")
+# Output path for the ROC curve PNG. Lives alongside the confusion matrix
+# in docs/visualizations/ so both figures end up in the same folder for the
+# final report.
 
 
 # ============================================================================
@@ -175,7 +183,8 @@ def load_trained_model(device, checkpoint_path=CHECKPOINT_PATH,
 
 def run_inference(model, loader, device):
     """
-    Run the model over every batch in `loader` and collect the predictions.
+    Run the model over every batch in `loader` and collect both the hard
+    class predictions AND the soft positive-class probabilities.
 
     Parameters
     ----------
@@ -192,11 +201,17 @@ def run_inference(model, loader, device):
     y_true : np.ndarray, shape (N,)
         Integer ground-truth labels for every sample in the test set.
     y_pred : np.ndarray, shape (N,)
-        Integer predicted labels (argmax over the 2 logits).
+        Integer predicted labels (argmax over the 2 logits — equivalent to
+        thresholding the positive-class probability at 0.5).
+    y_probs : np.ndarray, shape (N,)
+        Predicted probability of the POSITIVE (abnormal) class for every
+        sample, in [0, 1]. Required for ROC-AUC and any threshold-sweep
+        analysis (precision-recall curves, custom alarm thresholds, etc.).
     """
 
     all_labels = []
     all_preds = []
+    all_probs = []   # Positive-class probabilities for ROC-AUC.
 
     # torch.no_grad() disables autograd's tape recording for everything
     # inside the block — saves memory and CPU/GPU cycles. We never need
@@ -212,9 +227,25 @@ def run_inference(model, loader, device):
             # Forward pass — returns raw logits of shape [B, num_classes].
             logits = model(spectrograms)
 
+            # ---- Soft probabilities via softmax ----
+            # The model returns RAW logits (we deliberately left the softmax
+            # out of the architecture so that nn.CrossEntropyLoss could
+            # apply log-softmax internally during training). For ROC-AUC
+            # we now need actual probabilities — apply softmax over the
+            # class dimension to get a [B, 2] tensor whose rows sum to 1.
+            #
+            # We then slice column [:, 1] to extract only the POSITIVE
+            # class (abnormal) probability. ROC analysis is a one-versus-
+            # rest concept: we treat the model's confidence in "abnormal"
+            # as a continuous score and sweep a threshold across it.
+            probs = torch.softmax(logits, dim=1)
+            pos_probs = probs[:, 1]
+
             # argmax(dim=1) picks the class with the highest logit per
-            # sample. We don't need softmax probabilities here; argmax is
-            # invariant to monotonic transforms.
+            # sample. Equivalent to "is positive-class probability >= 0.5?"
+            # because softmax preserves the argmax. We keep this for the
+            # confusion matrix and the precision/recall/F1 metrics, which
+            # all need hard class labels.
             preds = logits.argmax(dim=1)
 
             # Move to CPU and convert to plain Python lists. sklearn lives
@@ -222,19 +253,21 @@ def run_inference(model, loader, device):
             # avoids holding many small tensors in memory across iterations.
             all_labels.extend(labels.cpu().tolist())
             all_preds.extend(preds.cpu().tolist())
+            all_probs.extend(pos_probs.cpu().tolist())
 
     # Convert once at the end to NumPy arrays — every sklearn metric
     # function takes them happily and the conversion is cheap.
-    return np.array(all_labels), np.array(all_preds)
+    return np.array(all_labels), np.array(all_preds), np.array(all_probs)
 
 
 # ============================================================================
 # METRICS
 # ============================================================================
 
-def compute_and_print_metrics(y_true, y_pred, positive_label=POSITIVE_LABEL):
+def compute_and_print_metrics(y_true, y_pred, y_probs,
+                              positive_label=POSITIVE_LABEL):
     """
-    Compute and print the four headline metrics for the test set.
+    Compute and print the five headline metrics for the test set.
 
     Precision/Recall/F1 are computed BINARY-style with `positive_label`
     treated as the class of interest. For us that's "abnormal" (label 1) —
@@ -245,7 +278,13 @@ def compute_and_print_metrics(y_true, y_pred, positive_label=POSITIVE_LABEL):
     y_true : np.ndarray, shape (N,)
         Ground-truth labels.
     y_pred : np.ndarray, shape (N,)
-        Predicted labels.
+        Predicted labels (argmax over logits).
+    y_probs : np.ndarray, shape (N,)
+        Predicted probability of the positive class for every sample.
+        Required for the threshold-independent ROC-AUC metric — the
+        precision/recall/F1 above all assume a fixed 0.5 threshold, but
+        ROC-AUC summarizes the model's ranking quality across EVERY
+        possible threshold.
     positive_label : int
         Which integer label counts as the "positive" class for binary
         precision/recall/F1. Default: 1 (abnormal).
@@ -253,8 +292,9 @@ def compute_and_print_metrics(y_true, y_pred, positive_label=POSITIVE_LABEL):
     Returns
     -------
     metrics : dict
-        Keys: "accuracy", "precision", "recall", "f1". Returned so callers
-        can log or re-display the numbers without re-computing them.
+        Keys: "accuracy", "precision", "recall", "f1", "roc_auc". Returned
+        so callers can log or re-display the numbers without re-computing
+        them.
     """
 
     # accuracy_score is class-agnostic — it just counts matches. Reported
@@ -273,6 +313,22 @@ def compute_and_print_metrics(y_true, y_pred, positive_label=POSITIVE_LABEL):
     f1 = f1_score(y_true, y_pred, pos_label=positive_label,
                   zero_division=0)
 
+    # ---- ROC-AUC: a threshold-independent summary of ranking quality ----
+    # roc_auc_score takes the TRUE labels and the POSITIVE-CLASS PROBABILITIES
+    # (NOT the hard 0/1 predictions) and returns the area under the ROC curve.
+    #
+    # Interpretation (the "Mann-Whitney" framing):
+    #   AUC = P(model assigns a higher abnormal-probability to a randomly
+    #         chosen abnormal sample than to a randomly chosen normal one)
+    #
+    # Reference points:
+    #   AUC = 1.0 → perfect ranking (every abnormal sample scores higher
+    #               than every normal one).
+    #   AUC = 0.5 → no better than random coin-flip.
+    #   AUC < 0.5 → systematically WORSE than random — usually a sign that
+    #               the labels are flipped.
+    roc_auc = roc_auc_score(y_true, y_probs)
+
     # Pretty-print so the user can paste the block straight into a report.
     print()
     print("=" * 60)
@@ -286,9 +342,13 @@ def compute_and_print_metrics(y_true, y_pred, positive_label=POSITIVE_LABEL):
     print(f"  Recall:    {recall:.4f}    (of true abnormal clips, how many "
           f"we caught)")
     print(f"  F1-Score:  {f1:.4f}    (harmonic mean of precision & recall)")
+    print(f"  ROC-AUC:   {roc_auc:.4f}    (ranking quality across ALL "
+          f"thresholds)")
     print()
     print("  ⤷ For predictive maintenance, RECALL is the metric to defend:")
     print("    a missed abnormal clip = a real machine fault going undetected.")
+    print("  ⤷ ROC-AUC is threshold-independent — useful when we want to")
+    print("    tune the alarm sensitivity AFTER training (see roc_curve.png).")
     print("=" * 60)
 
     return {
@@ -296,6 +356,7 @@ def compute_and_print_metrics(y_true, y_pred, positive_label=POSITIVE_LABEL):
         "precision": precision,
         "recall":    recall,
         "f1":        f1,
+        "roc_auc":   roc_auc,
     }
 
 
@@ -404,6 +465,145 @@ def plot_and_save_confusion_matrix(y_true, y_pred,
 
 
 # ============================================================================
+# ROC CURVE VISUALIZATION
+# ============================================================================
+
+def plot_and_save_roc_curve(y_true, y_probs, output_path=ROC_CURVE_PATH):
+    """
+    Compute the ROC curve from positive-class probabilities and save it as
+    a PNG plot annotated with the AUC score.
+
+    WHY EVALUATE ACROSS ALL THRESHOLDS (NOT JUST ARGMAX)?
+        The hard predictions used for accuracy/precision/recall/F1 implicitly
+        threshold the model's probability output at 0.5 — every sample whose
+        positive-class probability is at or above 0.5 is flagged abnormal,
+        every other sample is flagged normal. That single threshold is rarely
+        the right operational choice for predictive maintenance:
+
+          - If missing a fault is catastrophic (machine failure costs $$$$),
+            an operator wants to LOWER the threshold so MORE samples get
+            flagged as abnormal — recall goes up, precision goes down,
+            more false alarms but fewer missed faults.
+          - If false alarms are extremely expensive (sending a tech to every
+            flagged machine), they want to RAISE the threshold so ONLY the
+            most confident predictions trigger — precision goes up, recall
+            goes down.
+
+        The ROC curve plots that entire trade-off explicitly. For every
+        possible threshold t in [0, 1], it computes:
+            TPR(t) = Recall   = TP / (TP + FN)
+                                "fraction of real anomalies we catch"
+            FPR(t) = Fall-out = FP / (FP + TN)
+                                "fraction of healthy machines we falsely alarm"
+        and plots TPR vs. FPR as the threshold sweeps from 1.0 down to 0.0.
+
+        - Top-left corner (FPR=0, TPR=1) = perfect classifier.
+        - Diagonal y=x line             = random guessing baseline.
+        - Curve hugging the top-left    = strong model.
+        - Curve along the diagonal      = useless model.
+
+        AUC (Area Under the ROC Curve) condenses the entire curve to a
+        single threshold-independent number. AUC=1.0 is perfect; AUC=0.5 is
+        no better than coin flips. Because AUC doesn't depend on a chosen
+        threshold, it's the most honest single-number summary of model
+        quality on imbalanced data — and it lets stakeholders defend the
+        model regardless of where they ultimately set the alarm sensitivity.
+
+    Parameters
+    ----------
+    y_true : np.ndarray, shape (N,)
+        Ground-truth binary labels (0 = normal, 1 = abnormal).
+    y_probs : np.ndarray, shape (N,)
+        Predicted probability of the POSITIVE (abnormal) class for every
+        sample. NOT hard predictions — sklearn needs continuous scores so
+        it can sweep the threshold.
+    output_path : str
+        Where to save the PNG. Parent directory is created if missing.
+        Default: docs/visualizations/roc_curve.png.
+
+    Returns
+    -------
+    roc_auc : float
+        The computed ROC-AUC value. Returned so the caller can log it
+        without re-computing.
+    """
+
+    # roc_curve returns three parallel arrays of length n_thresholds:
+    #   fpr        - False Positive Rate at each threshold
+    #   tpr        - True  Positive Rate at each threshold
+    #   thresholds - the corresponding probability cutoffs (sorted high→low)
+    # sklearn picks all "interesting" thresholds (one per unique prob value
+    # plus an extra at the top) so the curve is exact, not subsampled.
+    # The third return (per-threshold cutoffs) is unused here — we plot
+    # the curve in (FPR, TPR) space rather than annotating threshold values.
+    fpr, tpr, _ = roc_curve(y_true, y_probs, pos_label=1)
+
+    # auc(fpr, tpr) integrates the curve via the trapezoid rule. Identical
+    # to roc_auc_score(y_true, y_probs) for binary problems, but we use
+    # auc() here so the area is computed from EXACTLY the points we'll
+    # also plot — guaranteeing the legend value matches the visible curve.
+    roc_auc = auc(fpr, tpr)
+
+    # Make sure the output directory exists.
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    # Build the figure. Square-ish aspect for an ROC plot is conventional
+    # because the axes share a [0, 1] range.
+    plt.figure(figsize=(7, 6))
+
+    # ---- Main curve: model performance across all thresholds ----
+    # color='C0' picks the first matplotlib default color (blue). lw=2 makes
+    # the curve clearly visible at report-print resolution.
+    plt.plot(fpr, tpr, color='C0', lw=2,
+             label=f"Model ROC (AUC = {roc_auc:.4f})")
+
+    # ---- Diagonal: random-classifier baseline ----
+    # A model that assigns probabilities uniformly at random produces a
+    # straight diagonal from (0,0) to (1,1). Plotting it gives the reader
+    # an instant visual reference: if our curve is hugging the diagonal,
+    # the model has learned nothing.
+    # linestyle='--' (dashed) and a muted gray make this read as "reference"
+    # rather than competing with the actual model curve.
+    plt.plot([0, 1], [0, 1], color='gray', lw=1, linestyle='--',
+             label="Random guessing (AUC = 0.5)")
+
+    # ---- Axis bounds, labels, title, legend ----
+    # Slightly extend the upper x bound so the curve doesn't bump against
+    # the right edge of the plot.
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel("False Positive Rate  (FP / (FP + TN))")
+    plt.ylabel("True Positive Rate  (Recall = TP / (TP + FN))")
+    plt.title("ROC Curve — Test Set")
+    # loc='lower right' is the conventional placement for ROC legends —
+    # keeps it out of the high-TPR / low-FPR region where the curve lives
+    # on a good model.
+    plt.legend(loc="lower right")
+
+    # Light grid helps readers eyeball specific (FPR, TPR) operating points
+    # if they want to choose a custom alarm threshold from the figure.
+    plt.grid(alpha=0.3)
+
+    # tight_layout prevents axis labels from being clipped on save.
+    plt.tight_layout()
+
+    # bbox_inches='tight' = save the smallest bounding box that contains
+    # everything (no extra whitespace). dpi=150 gives a crisp render at
+    # report-print resolution without bloating the file size.
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+
+    # Free the figure's memory.
+    plt.close()
+
+    print()
+    print(f"ROC curve saved: {output_path}")
+    print(f"  ROC-AUC = {roc_auc:.4f}  "
+          f"(0.5 = random, 1.0 = perfect)")
+
+    return roc_auc
+
+
+# ============================================================================
 # MAIN ORCHESTRATOR
 # ============================================================================
 
@@ -440,11 +640,15 @@ def main():
     print(f"  Loaded weights from: {CHECKPOINT_PATH}")
 
     # ---- 4. Inference + metrics + visualization ----
+    # run_inference now returns three arrays — true labels, hard predictions
+    # (for the discrete metrics + confusion matrix), and positive-class
+    # probabilities (for the threshold-independent ROC-AUC + curve).
     print("\n[4/4] Running inference on the test set...")
-    y_true, y_pred = run_inference(model, test_loader, device)
+    y_true, y_pred, y_probs = run_inference(model, test_loader, device)
 
-    compute_and_print_metrics(y_true, y_pred)
+    compute_and_print_metrics(y_true, y_pred, y_probs)
     plot_and_save_confusion_matrix(y_true, y_pred)
+    plot_and_save_roc_curve(y_true, y_probs)
 
     print("\nEvaluation complete.")
 
