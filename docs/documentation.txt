@@ -1053,3 +1053,213 @@ USAGE:
         python src/explain.py
     Requires the third-party `pytorch-grad-cam` package:
         pip install grad-cam
+
+
+================================================================================
+FILE: run_pipeline.py        (project root, NOT in src/)
+PURPOSE: Master orchestrator. Runs the entire pipeline end-to-end as a
+         sequence of subprocess calls, halting immediately on any failure.
+================================================================================
+
+WHY A SEPARATE ORCHESTRATOR?
+    For a reviewer (or our future selves) to reproduce every artifact in
+    the report — processed spectrograms, trained checkpoint, confusion
+    matrix, ROC curve, Grad-CAM heatmaps — we need ONE command that
+    runs everything in the correct order. run_pipeline.py is that
+    command.
+
+WHY subprocess.run INSTEAD OF DIRECT IMPORTS?
+    The intuitive alternative is to import each script's main() and call
+    them sequentially in a single Python process. We deliberately do NOT
+    do that, for four reasons:
+
+      1. MEMORY HYGIENE BETWEEN HEAVY ML STAGES.
+         preprocess.py loads librosa + audio buffers; dataset.py builds
+         tensor caches; train.py allocates the model, optimizer state,
+         gradient buffers, and a backward graph that can hold hundreds
+         of MB of activations. Once a stage finishes, we want ALL of
+         that memory returned to the OS.
+         A subprocess EXITS when the stage finishes — Python ref counts
+         get torn down, the CUDA context is destroyed, every byte is
+         reclaimed. A long import-and-call chain in one process leaves
+         partially-freed PyTorch caches that can OOM the next stage on
+         a small GPU (e.g. Colab's free-tier T4).
+
+      2. ISOLATED FAILURE MODES. If train.py crashes with a CUDA OOM,
+         the crash stays in the child process. The orchestrator's own
+         state is untouched and we get a clean non-zero exit code to
+         react to.
+
+      3. RESET GLOBAL STATE EVERY STAGE. PyTorch caches device kernels;
+         matplotlib accumulates open figures; numpy's RNG state shifts.
+         Restarting the interpreter for each stage gives every stage a
+         pristine starting environment, eliminating "works alone but
+         not in sequence" bugs.
+
+      4. EXACT PARITY WITH MANUAL RUNS. The commands the orchestrator
+         issues are the SAME commands a developer would type by hand
+         (`pytest`, `python src/preprocess.py`, etc.). Whatever works
+         here works one-by-one in the terminal too — no hidden
+         orchestrator-only behavior to debug later.
+
+PIPELINE ORDER:
+    1. pytest (tests/)         ← fast safety net; catch bugs in seconds
+    2. src/preprocess.py       ← .wav → .npy spectrograms
+    3. src/dataset.py          ← DataLoader smoke test (one batch)
+    4. src/model.py            ← model wiring smoke test (dummy forward)
+    5. src/train.py            ← actual training; writes best_model.pth
+    6. src/evaluate.py         ← test-set metrics + confusion matrix + ROC
+    7. src/explain.py          ← Grad-CAM heatmaps for the report
+
+ERROR HANDLING:
+    If any stage exits with a non-zero return code, the orchestrator
+    prints a loud bordered error block naming the failing stage and
+    halts immediately via sys.exit(returncode). Subsequent stages are
+    skipped because they would only fail in confusing ways (e.g.
+    evaluate.py would fail to load the checkpoint that train.py never
+    produced). Halting fast surfaces the real problem clearly.
+
+SUCCESS OUTPUT:
+    On success the orchestrator prints a per-stage timing summary so
+    unexpectedly slow stages are easy to spot over time:
+        Stage                                Time (s)
+        -----------------------------------  --------
+        Test Suite (pytest)                       2.1
+        Preprocessing (audio → .npy)             63.4
+        Dataset Smoke Test                        4.7
+        Model Smoke Test                          2.0
+        Training                               1450.9
+        Evaluation (test metrics)                 8.3
+        Explainability (Grad-CAM)                 5.1
+
+USAGE:
+    From the project root:
+        python run_pipeline.py
+
+
+================================================================================
+DIRECTORY: tests/
+PURPOSE: Pytest unit-test suite. Catches bugs in preprocess.py / dataset.py
+         / model.py CHEAPLY before the user spends 30+ minutes preprocessing
+         audio and training the model. This is the first stage that
+         run_pipeline.py runs.
+================================================================================
+
+DESIGN PRINCIPLE — NO DISK I/O, NO REAL .npy FILES, NO CHECKPOINTS:
+    Every test fabricates fake numpy arrays / torch tensors in memory and
+    feeds them directly to the public functions under test. We use
+    unittest.mock.patch to stub out librosa.load. The full suite runs in
+    well under a second of pure-Python time (the rest is torch import
+    overhead). This means:
+      - The tests are runnable in any environment where the project
+        deps are installed — no audio decoders, no GPU, no dataset.
+      - run_pipeline.py can run them as a fast precheck without slowing
+        the overall pipeline noticeably.
+      - Tests can't fail for environmental reasons (missing files,
+        permission errors, antivirus quarantines) — only for actual
+        code regressions.
+
+--------------------------------------------------------------------------------
+FILE: tests/conftest.py
+--------------------------------------------------------------------------------
+Auto-loaded by pytest before any test runs. Inserts <repo>/src into
+sys.path[0] so test files can do `from preprocess import ...` exactly
+the way the production modules import each other. Keeping the import
+style identical between production code and tests prevents subtle
+"works in tests but not in production" bugs caused by import-path
+divergence.
+
+--------------------------------------------------------------------------------
+FILE: tests/test_preprocess.py
+--------------------------------------------------------------------------------
+Pins down two contracts of preprocess.py:
+  1. After load_and_normalize_audio, the waveform is EXACTLY
+     TARGET_LENGTH_SAMPLES long — no off-by-one, regardless of whether
+     the original audio was longer, shorter, or already perfect length.
+     librosa.load is mocked with unittest.mock.patch so no real .wav file
+     is needed and the test runs in microseconds.
+  2. After generate_log_mel_spectrogram, the output is a 2D float
+     array of shape (N_MELS, ~313) AND values are dB-scaled (max <= 0).
+
+PROTECTS AGAINST:
+  - A refactor that uses np.resize (mod-wraps) instead of slice/pad —
+    silent corruption of every clip.
+  - np.pad called with the tuple in the wrong order, padding the START
+    of the clip instead of the END (silent label-leak: trains the model
+    that "abnormal" means "audio-then-silence").
+  - N_MELS being changed in preprocess.py without updating
+    DEFAULT_N_MELS in model.py — would only surface 30 min into
+    training as a cryptic Conv shape error.
+  - Someone deletes the librosa.power_to_db call. Shape would still
+    pass, but values would span 1e-10 to 1e+3, training would diverge
+    silently, and debugging would take hours.
+
+--------------------------------------------------------------------------------
+FILE: tests/test_dataset.py
+--------------------------------------------------------------------------------
+Pins down two contracts of dataset.py — both load-bearing for honest
+metrics on imbalanced data:
+  1. compute_class_weights heavily up-weights the minority class. The
+     test feeds in [0, 0, 0, 1] and asserts the inverse-frequency math
+     is exact (w0=4/(2*3)=0.667, w1=4/(2*1)=2.0, ratio=3.0).
+  2. stratified_split preserves class ratios within ±3 percentage
+     points across train/val/test, produces exact 70/15/15 sizes, and
+     emits NO overlap between subsets (the test for the data-leak
+     failure mode).
+
+PROTECTS AGAINST:
+  - "Math cleanup" that drops the inverse-frequency formula — the
+    model would silently collapse to "always normal" with high
+    accuracy and zero recall.
+  - A refactor that drops `stratify=labels` from sklearn's
+    train_test_split — would look fine on a balanced toy dataset but
+    degenerate on the real (heavily imbalanced) MIMII data.
+  - Off-by-one in the two-stage split's `relative_test_size` formula.
+  - The catastrophic refactor that feeds the FULL list (instead of
+    `temp_paths`) into the second train_test_split call — leaks
+    training samples into the test set, inflating the reported metrics.
+
+--------------------------------------------------------------------------------
+FILE: tests/test_model.py
+--------------------------------------------------------------------------------
+Pins down two contracts of model.py:
+  1. Standard input: a [2, 1, 128, 313] dummy tensor produces a
+     [2, 2] logits output — the integration assumption every other
+     part of the pipeline relies on.
+  2. Variable-length input: a [2, 1, 128, 800] tensor (a 25s clip)
+     produces the same [2, 2] output without crashing. This is the
+     SOLE test in the project that proves Global Average Pooling is
+     still in place. If GAP is ever silently replaced with a hard-coded
+     Flatten + Linear head, this test fails.
+Plus three supporting tests: float32 dtype contract, get_final_conv_layer
+returns an actual nn.Conv2d (not a Sequential), and a sanity check that
+forward() does NOT softmax internally.
+
+PROTECTS AGAINST:
+  - The most damaging refactor possible: replacing GAP with
+    `nn.Flatten + nn.Linear(19456, ...)`. Such a change adds ~2.5
+    million parameters in a single layer (a textbook overfitting
+    trap) AND breaks variable-length input support — but would NOT
+    break the standard-shape test alone. The 800-frame test catches
+    it directly.
+  - A regression that adds softmax inside forward() — output shape
+    would still be (B, 2), but CrossEntropyLoss would silently
+    double-apply log-softmax during training and gradients would be
+    nonsensical.
+  - get_final_conv_layer returning a wrong layer type (e.g. an
+    nn.Sequential after a refactor), which would silently produce
+    all-zero Grad-CAM heatmaps.
+
+USAGE:
+    Run the whole suite (from the project root):
+        python -m pytest tests/ -v
+
+    Run a single test file:
+        python -m pytest tests/test_model.py -v
+
+    Run a single test function:
+        python -m pytest tests/test_model.py::test_forward_pass_accepts_longer_time_axis -v
+
+    The full suite completes in seconds (torch import warmup dominates).
+    run_pipeline.py runs `python -m pytest tests/ -v` automatically as
+    its very first stage.
