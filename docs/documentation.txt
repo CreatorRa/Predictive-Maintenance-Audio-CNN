@@ -4,7 +4,7 @@ DOCUMENTATION — Predictive Maintenance Audio CNN
 This is a living document. Every function in the project is logged here with
 its location, signature, inputs/outputs, and a plain-English explanation.
 
-Last updated: 2026-04-23
+Last updated: 2026-04-25
 
 ================================================================================
 FILE: src/preprocess.py
@@ -300,3 +300,467 @@ Plain-English Summary:
     script you just call this once and you're ready to iterate. Returns
     everything the training loop needs: three loaders and the class weights
     array for the weighted loss function.
+
+
+================================================================================
+FILE: src/model.py
+PURPOSE: PyTorch CNN architecture (AudioClassifier) for binary classification
+         of Log-Mel-Spectrograms, with Grad-CAM target-layer support
+================================================================================
+
+--------------------------------------------------------------------------------
+Class: AudioClassifier
+Location: src/model.py
+--------------------------------------------------------------------------------
+Signature:
+    AudioClassifier(base_filters=16, num_classes=2, n_mels=128,
+                    time_frames=313, dropout_rate=0.5)
+    Methods: __init__, _forward_conv, forward, get_final_conv_layer
+
+Constructor Inputs:
+    - base_filters (int): Width of the first conv layer. Subsequent layers
+      use 2x, 4x, and 8x this value. Acts as the "model size" knob — the
+      single hyperparameter we tune to scale the network up or down.
+      Default: 16. (Try 32 or 64 on Colab for more capacity.)
+    - num_classes (int): Number of output logits. Default: 2 (normal/abnormal).
+    - n_mels (int): Expected height of input spectrograms. Default: 128.
+      Must match preprocess.py's N_MELS.
+    - time_frames (int): Expected width of input spectrograms. Default: 313.
+      Must match preprocess.py's output time-axis length.
+    - dropout_rate (float): Probability of zeroing each activation in the
+      two dropout layers. Default: 0.5.
+
+forward() Inputs:
+    - x (torch.Tensor, shape [B, 1, n_mels, time_frames]): A batch of
+      single-channel spectrograms — the exact format produced by
+      SpectrogramDataset/DataLoader from src/dataset.py.
+
+forward() Output:
+    - logits (torch.Tensor, shape [B, num_classes]): Raw, un-softmaxed class
+      scores. Pass directly into nn.CrossEntropyLoss during training; apply
+      torch.softmax(dim=1) at inference time if you want probabilities.
+
+get_final_conv_layer() Inputs:
+    - None.
+
+get_final_conv_layer() Output:
+    - nn.Conv2d: Direct reference to self.conv4 (the deepest convolutional
+      layer). Used by src/explain.py to attach Grad-CAM hooks.
+
+Plain-English Summary:
+    This class IS the neural network — a 4-block convolutional CNN that learns
+    to classify Log-Mel-Spectrograms as normal or abnormal. Each conv block
+    follows the standard recipe (Conv2d → BatchNorm2d → ReLU → MaxPool2d) and
+    doubles the channel count from the previous block, so depth grows
+    (16→32→64→128) as spatial size shrinks (128x313 → 64x156 → 32x78 →
+    16x39 → 8x19). After the conv stack, a Global Average Pooling layer
+    collapses each channel's spatial map to a single mean value, producing a
+    compact (B, base_filters*8) feature vector. That vector then passes
+    through a Dropout layer and a single Linear projection that outputs 2
+    raw logits per sample.
+
+    Four design choices worth highlighting:
+      1. base_filters is the only "size" knob. Doubling it doubles every
+         conv layer's width, which is the canonical way to scale CNN
+         capacity for hyperparameter tuning later in Colab.
+      2. GLOBAL AVERAGE POOLING (not Flatten) for the head. A naive Flatten
+         + Linear(128) head on the (B, 128, 8, 19) feature map would create
+         ~2.5 MILLION parameters in a single layer — guaranteed overfitting
+         on our small MIMII dataset. GAP collapses every spatial map to its
+         mean, slashing the head's parameter count by ~10,000x (down to ~258
+         params), acting as a strong structural regularizer, and making the
+         model agnostic to input duration (the same trained weights accept
+         spectrograms of any length).
+      3. The model is fully spatial-size agnostic. Because GAP averages over
+         whatever spatial dims the conv stack produces, n_mels and
+         time_frames are accepted as informational defaults but never
+         hard-coded into any layer's weight shape — change them in
+         preprocess.py and the model still works without code edits.
+      4. The final conv layer (self.conv4) is kept as a NAMED attribute
+         (not buried in nn.Sequential) and exposed via get_final_conv_layer(),
+         giving Grad-CAM a stable, reliable hook target.
+
+--------------------------------------------------------------------------------
+Method: AudioClassifier._forward_conv
+Location: src/model.py (private helper used by both __init__ and forward)
+--------------------------------------------------------------------------------
+Signature:
+    _forward_conv(self, x)
+
+Inputs:
+    - x (torch.Tensor, shape [B, 1, n_mels, time_frames]): A batch of
+      single-channel input spectrograms.
+
+Output:
+    - x (torch.Tensor, shape [B, base_filters*8, H_final, W_final]): The
+      deepest conv feature map (after pool4). With defaults this is
+      [B, 128, 8, 19].
+
+Plain-English Summary:
+    Internal helper that runs ONLY the convolutional portion of the network
+    (all four Conv→BN→ReLU→Pool blocks). It returns the 4D feature map BEFORE
+    flattening. This same method is used twice: (1) inside __init__ with a
+    dummy zeros-tensor to figure out the flattened-vector size for the first
+    Linear layer, and (2) at the start of every real forward() call. Sharing
+    one implementation prevents drift between "what the shape calculator
+    sees" and "what training actually does."
+
+--------------------------------------------------------------------------------
+Method: AudioClassifier.forward
+Location: src/model.py
+--------------------------------------------------------------------------------
+Signature:
+    forward(self, x)
+
+Inputs:
+    - x (torch.Tensor, shape [B, 1, n_mels, time_frames]): A batch of
+      spectrograms straight from the DataLoader.
+
+Output:
+    - logits (torch.Tensor, shape [B, num_classes]): Raw class scores.
+
+Plain-English Summary:
+    The full forward pass that PyTorch invokes when you write
+    `logits = model(spectrograms)`. It chains _forward_conv → global_pool →
+    flatten → dropout1 → fc_final to turn a batch of spectrograms into a
+    batch of 2-element logit vectors. The Global Average Pool step is what
+    collapses each channel's (H, W) feature map to a single mean value,
+    going from (B, 128, 8, 19) directly to (B, 128, 1, 1) — this is the
+    overfitting-prevention step that replaces the old 2.5M-parameter dense
+    head with a tiny 258-parameter linear classifier. We deliberately do
+    NOT apply softmax here because nn.CrossEntropyLoss applies log-softmax
+    internally in a numerically stable way; adding our own softmax would
+    double-apply it and silently corrupt training.
+
+--------------------------------------------------------------------------------
+Method: AudioClassifier.get_final_conv_layer
+Location: src/model.py
+--------------------------------------------------------------------------------
+Signature:
+    get_final_conv_layer(self)
+
+Inputs:
+    - None.
+
+Output:
+    - nn.Conv2d: Direct reference to self.conv4.
+
+Plain-English Summary:
+    A trivial accessor that exposes the deepest convolutional layer so
+    src/explain.py can attach Grad-CAM forward and backward hooks to it
+    without poking at AudioClassifier's internals. Returning the actual
+    layer (not a copy) is essential — Grad-CAM needs to capture activations
+    and gradients from real forward/backward passes, which only happen on
+    the live module that's wired into the model graph. Grad-CAM targets
+    the LAST conv layer because that's where the most semantically rich
+    features live while spatial structure is still preserved (FC layers
+    destroy spatial layout).
+
+
+================================================================================
+FILE: src/train.py
+PURPOSE: End-to-end training loop — wires DataLoaders + AudioClassifier
+         together, trains for NUM_EPOCHS with weighted CrossEntropyLoss + Adam,
+         and checkpoints the best model by validation loss.
+================================================================================
+
+--------------------------------------------------------------------------------
+Function: get_device
+Location: src/train.py
+--------------------------------------------------------------------------------
+Signature:
+    get_device()
+
+Inputs:
+    - None.
+
+Output:
+    - torch.device: The selected compute device (CUDA → MPS → CPU, in
+      preference order). Used as the .to(device) argument for the model
+      and for every batch of tensors during the training loop.
+
+Plain-English Summary:
+    Picks the fastest available compute backend at runtime so the same
+    script works locally on a Mac (MPS), on a Windows box with an NVIDIA
+    GPU (CUDA), on Colab (CUDA), or as a CPU-only fallback. Prints the
+    chosen device — and the GPU name when CUDA is selected — so you can
+    confirm the right hardware was picked before a long training run.
+
+--------------------------------------------------------------------------------
+Function: train_one_epoch
+Location: src/train.py
+--------------------------------------------------------------------------------
+Signature:
+    train_one_epoch(model, loader, criterion, optimizer, device)
+
+Inputs:
+    - model (nn.Module): An AudioClassifier already moved to `device`.
+    - loader (DataLoader): The TRAINING DataLoader from get_dataloaders().
+    - criterion (nn.Module): The weighted nn.CrossEntropyLoss instance.
+    - optimizer (torch.optim.Optimizer): Adam optimizer holding references
+      to the model's parameters.
+    - device (torch.device): Where each batch should be sent.
+
+Outputs:
+    - avg_loss (float): Mean per-sample loss across the entire training pass.
+    - accuracy (float): Fraction of correctly classified training samples.
+
+Plain-English Summary:
+    Runs ONE full pass over the training set with weight updates enabled.
+    For each batch it follows the canonical PyTorch training step:
+    optimizer.zero_grad() → forward → criterion → loss.backward() →
+    optimizer.step(). It calls model.train() up front so dropout is active
+    and BatchNorm tracks/uses current-batch statistics. Tracks running
+    totals to return per-sample mean loss and accuracy (using batch_size
+    weighting so the last short batch doesn't skew the average).
+
+--------------------------------------------------------------------------------
+Function: evaluate
+Location: src/train.py
+--------------------------------------------------------------------------------
+Signature:
+    evaluate(model, loader, criterion, device)
+
+Inputs:
+    - model (nn.Module): An AudioClassifier on `device`.
+    - loader (DataLoader): The validation or test DataLoader (un-shuffled).
+    - criterion (nn.Module): The same weighted CrossEntropyLoss used in training.
+    - device (torch.device): Compute device.
+
+Outputs:
+    - avg_loss (float): Mean per-sample loss across the entire split.
+    - accuracy (float): Fraction of correctly classified samples (reported
+      for sanity-checking but misleading on its own — see below).
+    - f1 (float): F1-score for the positive (abnormal) class — the metric
+      that actually drives model selection on imbalanced data.
+
+Plain-English Summary:
+    Runs the model over a held-out split WITHOUT updating weights. Calls
+    model.eval() (so dropout is disabled and BatchNorm uses its accumulated
+    running statistics) and wraps the entire loop in torch.no_grad() (so
+    autograd doesn't waste memory or compute building a backward graph).
+
+    Crucially, this function tracks F1-Score in addition to plain accuracy
+    to defeat the "Accuracy Paradox" on our imbalanced MIMII dataset: a
+    broken model that always predicts "normal" could score 90%+ accuracy
+    while catching ZERO anomalies — a disaster for predictive maintenance
+    that accuracy is happy to hide. F1 combines Precision (of the clips
+    we flagged as abnormal, how many really were?) and Recall (of the
+    clips that really were abnormal, how many did we catch?) into a
+    single harmonic-mean score that crashes to 0 the moment either is
+    poor — exactly the honest signal we need.
+
+    Implementation note: F1 is NOT batch-additive (you can't average
+    batch-level F1s to get the dataset-level F1), so we accumulate every
+    prediction and every label across the whole epoch into Python lists
+    and call sklearn's f1_score(all_labels, all_preds, pos_label=1,
+    zero_division=0) once at the end. pos_label=1 picks out the abnormal
+    class as the "positive" event we care about; zero_division=0 ensures
+    a model with zero positive predictions scores 0.0 instead of raising
+    a runtime warning.
+
+    This is what we use both during training (per-epoch validation) and,
+    later, for final test-set evaluation in a separate script.
+
+--------------------------------------------------------------------------------
+Function: main
+Location: src/train.py
+--------------------------------------------------------------------------------
+Signature:
+    main()
+
+Inputs:
+    - None. Reads the module-level constants (LEARNING_RATE, NUM_EPOCHS,
+      BATCH_SIZE, BASE_FILTERS, NUM_WORKERS, CHECKPOINT_DIR, CHECKPOINT_PATH).
+
+Output:
+    - None. Side effects: trains the model in place and writes the best
+      checkpoint to models/best_model.pth. Prints a per-epoch progress
+      table and a final summary of best validation loss + checkpoint path.
+
+Plain-English Summary:
+    The orchestrator that runs when you launch `python src/train.py` from
+    the project root. It does the full job in five steps:
+      1. Pick a device (CUDA / MPS / CPU).
+      2. Build the train/val/test DataLoaders and pull the inverse-frequency
+         class weights computed from the training split.
+      3. Instantiate AudioClassifier with BASE_FILTERS and move it to device.
+      4. Build a weighted nn.CrossEntropyLoss (with the class weights tensor
+         shipped to the same device as the model), an Adam optimizer, and a
+         ReduceLROnPlateau scheduler (mode='min', factor=0.5, patience=3)
+         that halves the learning rate whenever validation loss plateaus.
+      5. Loop for up to NUM_EPOCHS, calling train_one_epoch then evaluate on
+         each iteration. evaluate() now returns three values — loss, plain
+         accuracy, AND the imbalance-aware F1-score for the abnormal class
+         — and main() prints all three in a tabular per-epoch log row
+         alongside the current learning rate. Each epoch:
+           - scheduler.step(val_loss) is called so the LR can adapt; if it
+             dropped, the per-epoch log row gets a "LR↓" annotation showing
+             the old → new LR. Smaller steps near a minimum prevent
+             overshoot and squeeze out the last bit of accuracy.
+           - If validation loss strictly improves, save model.state_dict()
+             to models/best_model.pth and reset the early-stopping counter.
+             Otherwise increment that counter.
+           - If the counter reaches EARLY_STOPPING_PATIENCE (default 7),
+             break out of the loop and print an early-stopping notice.
+             This saves Colab compute and prevents overfitting by halting
+             once validation loss has clearly plateaued.
+         Saving state_dict (not the full pickled model) is the recommended
+         PyTorch pattern — smaller, more portable, and decoupled from the
+         model class definition. The script ends by printing the best
+         epoch and the path to its checkpoint.
+
+
+================================================================================
+FILE: src/evaluate.py
+PURPOSE: Final test-set evaluation. Loads the best checkpoint produced by
+         train.py, runs inference once on the held-out test split, prints
+         Accuracy/Precision/Recall/F1 for the abnormal class, and saves a
+         confusion-matrix heatmap PNG to docs/visualizations/.
+================================================================================
+
+--------------------------------------------------------------------------------
+Function: load_trained_model
+Location: src/evaluate.py
+--------------------------------------------------------------------------------
+Signature:
+    load_trained_model(device, checkpoint_path=CHECKPOINT_PATH,
+                       base_filters=BASE_FILTERS)
+
+Inputs:
+    - device (torch.device): Where the model should live (cuda / mps / cpu).
+    - checkpoint_path (str): Path to the .pth file saved by train.py.
+      Default: train.py's CHECKPOINT_PATH (models/best_model.pth).
+    - base_filters (int): Conv-stack width. MUST match the value used at
+      training time, otherwise the state_dict shapes won't align.
+      Default: train.py's BASE_FILTERS.
+
+Output:
+    - model (AudioClassifier): Architecture rebuilt, weights loaded from
+      disk, moved to `device`, and switched into eval() mode (dropout off,
+      BatchNorm using running statistics).
+
+Plain-English Summary:
+    Helper that handles the three steps of "use a trained model": build a
+    fresh AudioClassifier with the same hyperparameters as training, load
+    the saved state_dict from disk (using map_location=device for safe
+    cross-device transfer), and put the model into eval mode. Raises a
+    clear FileNotFoundError if the checkpoint is missing — usually meaning
+    the user ran evaluate.py before train.py.
+
+--------------------------------------------------------------------------------
+Function: run_inference
+Location: src/evaluate.py
+--------------------------------------------------------------------------------
+Signature:
+    run_inference(model, loader, device)
+
+Inputs:
+    - model (nn.Module): Trained AudioClassifier in eval mode on `device`.
+    - loader (DataLoader): The TEST DataLoader (un-shuffled).
+    - device (torch.device): Compute device.
+
+Outputs:
+    - y_true (np.ndarray, shape (N,)): Integer ground-truth labels for
+      every test sample.
+    - y_pred (np.ndarray, shape (N,)): Integer predicted labels (argmax
+      over the model's 2 logits).
+
+Plain-English Summary:
+    Loops once over the test DataLoader inside torch.no_grad() (no autograd
+    overhead — we're not training), runs the forward pass on each batch,
+    takes argmax to convert logits into hard class predictions, and pulls
+    the results back to the CPU as Python lists. Concatenates everything
+    into two parallel NumPy arrays at the end so they're ready for sklearn's
+    metrics functions, which only accept array-like inputs.
+
+--------------------------------------------------------------------------------
+Function: compute_and_print_metrics
+Location: src/evaluate.py
+--------------------------------------------------------------------------------
+Signature:
+    compute_and_print_metrics(y_true, y_pred, positive_label=1)
+
+Inputs:
+    - y_true (np.ndarray): Ground-truth labels.
+    - y_pred (np.ndarray): Predicted labels.
+    - positive_label (int): Which class counts as "positive" for the binary
+      precision/recall/F1 calculations. Default: 1 (abnormal).
+
+Output:
+    - metrics (dict): {"accuracy", "precision", "recall", "f1"} — returned
+      so callers can log the numbers without recomputing them.
+
+Plain-English Summary:
+    Computes and pretty-prints the four headline test-set metrics:
+    Accuracy, Precision, Recall, and F1-Score. All three of the binary
+    metrics target the abnormal class (pos_label=1) because that's the
+    event predictive maintenance actually cares about. zero_division=0
+    is passed everywhere so a model that produces no positive predictions
+    scores 0.0 cleanly instead of triggering NaN or a runtime warning.
+    The print block also includes a one-line reminder that RECALL is the
+    most important metric in this domain — a missed abnormal sample
+    means a real machine fault going undetected.
+
+--------------------------------------------------------------------------------
+Function: plot_and_save_confusion_matrix
+Location: src/evaluate.py
+--------------------------------------------------------------------------------
+Signature:
+    plot_and_save_confusion_matrix(y_true, y_pred,
+                                    output_path=CONFUSION_MATRIX_PATH,
+                                    class_names=["Normal", "Abnormal"])
+
+Inputs:
+    - y_true (np.ndarray): Ground-truth labels.
+    - y_pred (np.ndarray): Predicted labels.
+    - output_path (str): Where to save the PNG. The parent directory is
+      created on demand. Default: docs/visualizations/confusion_matrix.png.
+    - class_names (list of str): Display labels for the matrix axes,
+      ordered by integer class index. Default: ["Normal", "Abnormal"].
+
+Output:
+    - cm (np.ndarray, shape (2, 2)): The raw count matrix returned for
+      programmatic use (e.g., extracting the FN cell for additional logging).
+      Side effects: writes the heatmap PNG to disk and prints the matrix
+      as a labeled text block to stdout.
+
+Plain-English Summary:
+    Builds the 2x2 confusion matrix with sklearn (forcing label order
+    [0, 1] so the layout is deterministic across runs), then renders it
+    as a Blues-colormap seaborn heatmap with integer cell annotations,
+    descriptive axis labels, and a title. Saves the figure as a 150-dpi
+    PNG to docs/visualizations/ for use in the final report. Also prints
+    the matrix to stdout in a labeled text format so the False Positive
+    (false alarm) and False Negative (missed fault) counts are visible
+    even without opening the PNG. In predictive maintenance the FN cell
+    is the most important one to watch — that's the category of error
+    that means a real anomaly slipped through.
+
+--------------------------------------------------------------------------------
+Function: main
+Location: src/evaluate.py
+--------------------------------------------------------------------------------
+Signature:
+    main()
+
+Inputs:
+    - None. Reads the module-level constants and reuses BATCH_SIZE,
+      NUM_WORKERS, BASE_FILTERS, CHECKPOINT_PATH, and get_device imported
+      from src/train.py to keep evaluation in lock-step with training.
+
+Output:
+    - None. Side effects: prints the four headline metrics + the textual
+      confusion matrix to stdout, and writes the heatmap PNG to
+      docs/visualizations/confusion_matrix.png.
+
+Plain-English Summary:
+    The orchestrator that runs when you launch `python src/evaluate.py`
+    from the project root. Picks a device, builds the test DataLoader
+    (deliberately discarding the train and val loaders so test-time
+    information can't leak back into training decisions), loads the best
+    checkpoint via load_trained_model, runs run_inference to collect all
+    predictions, and finally calls compute_and_print_metrics and
+    plot_and_save_confusion_matrix. This is the script we run ONCE at
+    the very end of the project to produce the numbers and figure that
+    go into the final report.

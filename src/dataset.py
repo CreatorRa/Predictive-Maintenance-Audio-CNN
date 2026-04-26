@@ -10,12 +10,12 @@ WHAT THIS FILE PROVIDES:
     1. File discovery + binary label assignment (normal=0, abnormal=1).
     2. Stratified train/val/test splitting (70/15/15) via scikit-learn.
     3. Class weight computation — critical because MIMII is typically imbalanced
-       (many more "normal" files than "abnormal" ones). Without class weighting,
+       (Way more "normal" files than "abnormal" ones). Without class weighting,
        the model can achieve ~95% accuracy by simply predicting "normal" every
        time, which is useless for anomaly detection.
     4. A custom PyTorch Dataset class that uses LAZY LOADING — spectrograms are
        read from disk one at a time inside __getitem__ rather than loaded all at
-       once into RAM. This lets us train on datasets far larger than memory.
+       once into RAM. This lets us train on datasets far larger than memory. This was a major issue early on.
     5. A factory function that wraps the three Datasets into DataLoader objects
        with appropriate shuffling and batching behavior.
 
@@ -26,8 +26,9 @@ WHY LAZY LOADING?
     With 5,000 files that's ~800 MB — manageable, but multiplied by machine
     types and augmentations it balloons fast. On Colab's free tier (12 GB RAM)
     and shared with PyTorch's own overhead, eagerly loading everything is a
-    recipe for OOM crashes. Lazy loading keeps memory use flat regardless of
-    dataset size: only the current batch lives in RAM at any moment.
+    recipe for OOM crashes. 
+    **Lazy loading keeps memory use flat regardless of
+    dataset size: only the current batch lives in RAM at any moment.**
 
 WHY THE SINGLE CHANNEL DIMENSION [1, H, W]?
     PyTorch Conv2D layers expect inputs of shape [batch, channels, height, width].
@@ -385,7 +386,7 @@ class SpectrogramDataset(Dataset):
         file has shape (n_mels, n_time) with no channel dimension.
     """
 
-    def __init__(self, file_paths, labels):
+    def __init__(self, file_paths, labels, transform=None):
         """
         Store file paths and labels. DO NOT load any arrays here.
 
@@ -396,17 +397,15 @@ class SpectrogramDataset(Dataset):
         labels : list of int
             Integer class labels, parallel to file_paths.
         """
-        # Defensive check: mismatched lengths would silently produce wrong
-        # pairings of inputs to labels — a nightmare bug to debug.
+        # Defensive check: mismatched lengths would silently produce wrong pairings of inputs to labels — a nightmare bug to debug.
         assert len(file_paths) == len(labels), (
             f"file_paths and labels must have the same length, "
             f"got {len(file_paths)} vs {len(labels)}"
         )
-
-        # Store as instance attributes. Python lists are references (not copies),
-        # so this costs essentially no memory.
+        # Store as instance attributes. Python lists are references (not copies), so this costs essentially no memory.
         self.file_paths = file_paths
         self.labels = labels
+        self.transform = transform #Added to store augmentation functions.
 
     def __len__(self):
         """
@@ -430,7 +429,6 @@ class SpectrogramDataset(Dataset):
         ----------
         idx : int
             Index into the dataset. 0 <= idx < len(self).
-
         Returns
         -------
         spectrogram : torch.FloatTensor, shape (1, n_mels, n_time_frames)
@@ -454,6 +452,14 @@ class SpectrogramDataset(Dataset):
         # causes dtype errors).
         spectrogram = torch.from_numpy(spectrogram_np).float()
 
+        #--- Step B.5: Per-sample Standardization
+        # Centers the data around zero to stabilize the graident descent. We compute mean and std per sample to avoid data leakage across samples. This is a common practice for spectrogram inputs.
+        mean = spectrogram.mean()
+        std = spectrogram.std()
+
+        if std > 1e-6: # prevents division by zero
+            spectrogram = (spectrogram - mean) / std
+        
         # --- Step C: Add the channel dimension ---
         # Current shape: (n_mels, n_time_frames)
         # Target shape:  (1, n_mels, n_time_frames)
@@ -467,6 +473,9 @@ class SpectrogramDataset(Dataset):
         # --- Step D: Wrap the label in a tensor ---
         # dtype=torch.long is required by nn.CrossEntropyLoss for class indices.
         # If you accidentally pass float, PyTorch raises a cryptic error.
+        if self.transform:
+            spectrogram = self.transform(spectrogram) #Apply augmentation if provided.
+        
         label = torch.tensor(self.labels[idx], dtype=torch.long)
 
         return spectrogram, label
