@@ -98,7 +98,9 @@ USAGE:
 # IMPORTS
 # ============================================================================
 
+import argparse                    # CLI args for HPO compatibility
 import os                          # Filesystem operations (mkdirs, path joins)
+import sys                         # Used to make the project root importable
 import numpy as np                 # Heatmap math + image array manipulation
 import torch                       # PyTorch core for model, tensors, device
 import matplotlib.pyplot as plt    # Plotting and saving the PNG figures
@@ -129,36 +131,39 @@ from pytorch_grad_cam.utils.image import show_cam_on_image
 # surprises when the model is confidently wrong on a sample.)
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 
+# --- Make `from src.xxx import ...` work when running this file directly. ---
+# Same trick used in src/train.py and src/evaluate.py: prepend the project
+# root to sys.path so absolute imports below resolve regardless of how the
+# script is launched.
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 # Our project modules. We deliberately reuse the SAME helpers that train.py
 # and evaluate.py use so explanation runs in lock-step with training/eval —
-# any change to BASE_FILTERS, the checkpoint path, or the device-picking
-# logic propagates automatically.
-from model import AudioClassifier
-from dataset import get_dataloaders
-# get_device and the training-time hyperparameters live in train.py. Importing
-# them here guarantees the architecture we instantiate matches the one whose
-# weights are stored in best_model.pth.
-from train import get_device, BASE_FILTERS, CHECKPOINT_PATH
+# any change to the checkpoint dir or device-picking logic propagates
+# automatically.
+from src.model import AudioClassifier
+from src.dataset import get_dataloaders
+# get_device and CHECKPOINT_DIR live in train.py. Per-run --base_filters and
+# --run_name now come from the CLI, not module-level constants.
+from src.train import get_device, CHECKPOINT_DIR
 # SAMPLE_RATE and HOP_LENGTH come from preprocess.py because they govern
 # the time axis of the spectrogram: each column corresponds to HOP_LENGTH
 # samples at SAMPLE_RATE Hz. librosa.display.specshow uses both to convert
 # column indices into seconds, so the values here MUST match whatever
 # preprocess.py used when generating the .npy files.
-from preprocess import SAMPLE_RATE, HOP_LENGTH
+from src.preprocess import SAMPLE_RATE, HOP_LENGTH
 
 
 # ============================================================================
-# CONFIGURATION — Output paths and class display names
+# CONFIGURATION — Output dir + class display names. Per-file paths are built
+# inside main() once we know the run_name from CLI args.
 # ============================================================================
 
-# Directory where we drop the two PNGs. We deliberately reuse the same folder
-# evaluate.py writes to so all "report assets" live in one place.
-VISUALIZATION_DIR = os.path.join("docs", "visualizations")
-
-# Output filenames. Keep them descriptive — these end up embedded in the
-# final report and need to be self-explanatory at a glance.
-GRADCAM_NORMAL_PATH   = os.path.join(VISUALIZATION_DIR, "gradcam_normal.png")
-GRADCAM_ABNORMAL_PATH = os.path.join(VISUALIZATION_DIR, "gradcam_abnormal.png")
+# Directory where we drop the two PNGs. We reuse the same folder evaluate.py
+# writes to so all "report assets" live in one place.
+VISUALIZATION_DIR = os.path.join(PROJECT_ROOT, "docs", "visualizations")
 
 # Display labels. Index matches the integer class label (normal=0, abnormal=1).
 # Matches the convention from dataset.py / evaluate.py.
@@ -166,11 +171,37 @@ CLASS_NAMES = ["Normal", "Abnormal"]
 
 
 # ============================================================================
+# CLI ARGUMENT PARSING
+# ============================================================================
+
+def parse_args():
+    """
+    Mirror train.py / evaluate.py — selects which checkpoint to load and
+    embeds run_name in the heatmap filenames so HPO experiments don't
+    clobber one another's explanation figures.
+    """
+    parser = argparse.ArgumentParser(
+        description="Generate Grad-CAM heatmaps for a trained AudioClassifier."
+    )
+    parser.add_argument("--base_filters", type=int, default=16,
+                        help="Conv-stack width — MUST match training value.")
+    parser.add_argument("--run_name", type=str, default="default_run",
+                        help="Run tag — selects checkpoint and namespaces "
+                             "the output PNGs.")
+    # batch_size / lr are accepted but unused — keeping the signature uniform
+    # across train/evaluate/explain lets tune.py shell out with the same args.
+    parser.add_argument("--batch_size", type=int, default=32,
+                        help="Accepted for CLI uniformity; ignored here.")
+    parser.add_argument("--lr", type=float, default=1e-3,
+                        help="Accepted for CLI uniformity; ignored here.")
+    return parser.parse_args()
+
+
+# ============================================================================
 # STEP 1 — LOAD THE TRAINED MODEL
 # ============================================================================
 
-def load_model_for_explain(device, checkpoint_path=CHECKPOINT_PATH,
-                           base_filters=BASE_FILTERS):
+def load_model_for_explain(device, checkpoint_path, base_filters):
     """
     Rebuild the AudioClassifier architecture, load the trained weights from
     disk, push it to `device`, and switch it into eval() mode.
@@ -572,17 +603,23 @@ def plot_and_save_explanation(spec_2d, heatmap, class_name, output_path):
 
 def main():
     """
-    Top-level entry point. Wires every step together:
-        1. Pick a device.
-        2. Load the trained model and identify the Grad-CAM target layer.
-        3. Build the test DataLoader and pluck one sample of each class.
-        4. Run Grad-CAM on each sample (back-propping from the GROUND TRUTH
-           class so the heatmap shows "why this sample looks like {true label}").
-        5. Render and save the two side-by-side comparison figures.
+    Top-level entry point. Loads the run-specific checkpoint, picks one
+    sample of each class from the test set, and writes per-run Grad-CAM
+    figures whose filenames include run_name so HPO results stay distinct.
     """
+
+    # ---- 0. Parse CLI args ----
+    args = parse_args()
+
+    # Per-run paths — checkpoint to load, plus the two heatmap PNGs to write.
+    checkpoint_path       = os.path.join(CHECKPOINT_DIR, f"best_model_{args.run_name}.pth")
+    gradcam_normal_path   = os.path.join(VISUALIZATION_DIR, f"gradcam_normal_{args.run_name}.png")
+    gradcam_abnormal_path = os.path.join(VISUALIZATION_DIR, f"gradcam_abnormal_{args.run_name}.png")
 
     print("=" * 60)
     print("GRAD-CAM EXPLAINABILITY")
+    print(f"  Run name:    {args.run_name}")
+    print(f"  Checkpoint:  {checkpoint_path}")
     print("=" * 60)
 
     # --- 1. Device selection (reuses train.py's helper for consistency) ---
@@ -593,7 +630,11 @@ def main():
     # target_layers MUST be a list — the library is built to support
     # explaining multiple layers at once even though we only use one.
     print("\n[2/5] Loading trained model...")
-    model = load_model_for_explain(device)
+    model = load_model_for_explain(
+        device,
+        checkpoint_path=checkpoint_path,
+        base_filters=args.base_filters,
+    )
     target_layers = [model.get_final_conv_layer()]
 
     # --- 3. Build the test DataLoader and pick one sample per class ---
@@ -602,7 +643,7 @@ def main():
     # train/val data here would defeat the purpose of an unbiased
     # qualitative check.
     print("\n[3/5] Building test DataLoader and selecting samples...")
-    _, _, test_loader, _ = get_dataloaders()
+    _, _, test_loader, _ = get_dataloaders(batch_size=args.batch_size)
     normal_spec, abnormal_spec = find_one_per_class(test_loader)
     print(f"  Found one Normal and one Abnormal sample.")
 
@@ -622,7 +663,7 @@ def main():
         spec_2d=spec_2d,
         heatmap=heatmap,
         class_name=CLASS_NAMES[0],
-        output_path=GRADCAM_NORMAL_PATH,
+        output_path=gradcam_normal_path,
     )
 
     # --- 4 & 5. Generate and save Grad-CAM for the Abnormal sample ---
@@ -642,7 +683,7 @@ def main():
         spec_2d=spec_2d,
         heatmap=heatmap,
         class_name=CLASS_NAMES[1],
-        output_path=GRADCAM_ABNORMAL_PATH,
+        output_path=gradcam_abnormal_path,
     )
 
     print("\n" + "=" * 60)

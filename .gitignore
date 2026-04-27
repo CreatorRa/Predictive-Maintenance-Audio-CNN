@@ -215,3 +215,6 @@ data/audio/
 *.pt
 *.pth
 *.h5
+
+#misclaneous
+.claude/
