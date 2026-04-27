@@ -49,6 +49,7 @@ USAGE:
 # IMPORTS
 # ============================================================================
 
+import argparse          # CLI args — replaces shared constants imported from train.py
 import os                # Filesystem paths + makedirs for the visualization dir
 import sys               # Used to make the project root importable
 
@@ -81,12 +82,10 @@ if PROJECT_ROOT not in sys.path:
 
 from src.dataset import get_dataloaders        # Builds the test DataLoader
 from src.model import AudioClassifier           # The CNN architecture
-from src.train import (                         # Reuse training-time settings
+from src.train import (                         # Reuse only the truly-shared bits
     get_device,
-    BASE_FILTERS,
-    BATCH_SIZE,
     NUM_WORKERS,
-    CHECKPOINT_PATH,
+    CHECKPOINT_DIR,
 )
 
 
@@ -106,24 +105,50 @@ POSITIVE_LABEL = 1
 # with this class as the focus.
 
 VISUALIZATION_DIR = os.path.join(PROJECT_ROOT, "docs", "visualizations")
-# Where confusion-matrix and other report-ready figures live. Created on
-# demand if missing.
+# Where confusion-matrix and ROC PNGs live. Created on demand if missing.
 
-CONFUSION_MATRIX_PATH = os.path.join(VISUALIZATION_DIR, "confusion_matrix.png")
-# Output path for the heatmap PNG. Overwritten every time evaluate.py runs.
+EXPERIMENT_TRACKING_CSV = os.path.join(PROJECT_ROOT, "docs", "experiment_tracking.csv")
+# Master HPO log. Each call to evaluate.py appends one row (header on first write).
 
-ROC_CURVE_PATH = os.path.join(VISUALIZATION_DIR, "roc_curve.png")
-# Output path for the ROC curve PNG. Lives alongside the confusion matrix
-# in docs/visualizations/ so both figures end up in the same folder for the
-# final report.
+
+# ============================================================================
+# CLI ARGUMENT PARSING
+# ============================================================================
+
+def parse_args():
+    """
+    CLI args mirror those of train.py so a single (lr, batch_size, base_filters,
+    run_name) tuple propagates through the entire HPO pipeline:
+        train.py    → produces best_model_{run_name}.pth
+        evaluate.py → loads best_model_{run_name}.pth, writes per-run figures
+                      and APPENDS a row to docs/experiment_tracking.csv
+        explain.py  → loads best_model_{run_name}.pth, writes per-run heatmaps
+
+    base_filters MUST match the value used when the checkpoint was saved.
+    Mismatches cause load_state_dict to raise a shape error — that's a feature,
+    not a bug, because it loudly catches mis-tagged runs.
+    """
+    parser = argparse.ArgumentParser(
+        description="Evaluate a trained AudioClassifier checkpoint."
+    )
+    parser.add_argument("--lr", type=float, default=1e-3,
+                        help="Learning rate the model was trained with. "
+                             "Recorded in the CSV; not used for inference.")
+    parser.add_argument("--batch_size", type=int, default=32,
+                        help="Batch size for the test DataLoader.")
+    parser.add_argument("--base_filters", type=int, default=16,
+                        help="Conv-stack width — MUST match training value.")
+    parser.add_argument("--run_name", type=str, default="default_run",
+                        help="Run tag — selects which checkpoint to load and "
+                             "is embedded in every output filename.")
+    return parser.parse_args()
 
 
 # ============================================================================
 # MODEL LOADING
 # ============================================================================
 
-def load_trained_model(device, checkpoint_path=CHECKPOINT_PATH,
-                       base_filters=BASE_FILTERS):
+def load_trained_model(device, checkpoint_path, base_filters):
     """
     Build a fresh AudioClassifier and load the trained weights from disk.
 
@@ -132,13 +157,13 @@ def load_trained_model(device, checkpoint_path=CHECKPOINT_PATH,
     device : torch.device
         Where the model will live (cuda / mps / cpu).
     checkpoint_path : str
-        Path to the .pth file produced by src/train.py. Default: the
-        CHECKPOINT_PATH constant exported by train.py.
+        Path to the .pth file produced by src/train.py. Caller builds this
+        path from the run_name CLI arg so HPO runs stay distinct.
     base_filters : int
         Width of the first conv layer. MUST match whatever value was used
         when the checkpoint was saved — otherwise the state_dict's tensor
         shapes won't line up with the freshly-built model and load_state_dict
-        will raise a size-mismatch error. Default: train.py's BASE_FILTERS.
+        will raise a size-mismatch error.
 
     Returns
     -------
@@ -365,7 +390,7 @@ def compute_and_print_metrics(y_true, y_pred, y_probs,
 # ============================================================================
 
 def plot_and_save_confusion_matrix(y_true, y_pred,
-                                    output_path=CONFUSION_MATRIX_PATH,
+                                    output_path,
                                     class_names=CLASS_NAMES):
     """
     Build a 2x2 confusion matrix from the test predictions and save it
@@ -385,7 +410,8 @@ def plot_and_save_confusion_matrix(y_true, y_pred,
         Predicted labels.
     output_path : str
         Where to write the PNG. Parent directory is created if missing.
-        Default: docs/visualizations/confusion_matrix.png.
+        Caller is responsible for embedding the run_name in this path so
+        HPO experiments do not overwrite each other.
     class_names : list of str
         Display labels for the axes, ordered by integer class index.
         Default: ["Normal", "Abnormal"].
@@ -468,7 +494,7 @@ def plot_and_save_confusion_matrix(y_true, y_pred,
 # ROC CURVE VISUALIZATION
 # ============================================================================
 
-def plot_and_save_roc_curve(y_true, y_probs, output_path=ROC_CURVE_PATH):
+def plot_and_save_roc_curve(y_true, y_probs, output_path):
     """
     Compute the ROC curve from positive-class probabilities and save it as
     a PNG plot annotated with the AUC score.
@@ -519,7 +545,7 @@ def plot_and_save_roc_curve(y_true, y_probs, output_path=ROC_CURVE_PATH):
         it can sweep the threshold.
     output_path : str
         Where to save the PNG. Parent directory is created if missing.
-        Default: docs/visualizations/roc_curve.png.
+        Caller embeds the run_name so HPO experiments stay distinct.
 
     Returns
     -------
@@ -609,48 +635,133 @@ def plot_and_save_roc_curve(y_true, y_probs, output_path=ROC_CURVE_PATH):
 
 def main():
     """
-    Wire everything together: device → test loader → model checkpoint →
-    inference → metrics → confusion matrix.
-
-    Runs when you launch `python src/evaluate.py` from the project root.
+    Wire everything together: args → device → test loader → checkpoint →
+    inference → metrics → confusion matrix → ROC curve → CSV row.
     """
+
+    # ---- 0. Parse CLI args ----
+    args = parse_args()
+
+    # Per-run paths — every output filename is namespaced by run_name so
+    # HPO experiments produce a parallel set of figures we can compare later.
+    checkpoint_path        = os.path.join(CHECKPOINT_DIR, f"best_model_{args.run_name}.pth")
+    confusion_matrix_path  = os.path.join(VISUALIZATION_DIR, f"confusion_matrix_{args.run_name}.png")
+    roc_curve_path         = os.path.join(VISUALIZATION_DIR, f"roc_curve_{args.run_name}.png")
 
     print("=" * 60)
     print("EVALUATION — AudioClassifier on Held-Out Test Set")
+    print(f"  Run name:    {args.run_name}")
+    print(f"  Checkpoint:  {checkpoint_path}")
     print("=" * 60)
 
     # ---- 1. Device ----
-    print("\n[1/4] Selecting compute device...")
+    print("\n[1/5] Selecting compute device...")
     device = get_device()
 
     # ---- 2. Data ----
-    # We only need the test loader. The train and val loaders are still
-    # built (the function builds all three together so the splits stay
-    # reproducible), but we deliberately discard them so we never
-    # accidentally let test-time decisions leak back into training.
-    print("\n[2/4] Building test DataLoader...")
+    # We only need the test loader. The train and val loaders are still built
+    # (the function builds all three together so the splits stay reproducible),
+    # but we deliberately discard them so we never let test-time decisions
+    # leak back into training.
+    print("\n[2/5] Building test DataLoader...")
     _train, _val, test_loader, _weights = get_dataloaders(
-        batch_size=BATCH_SIZE,
+        batch_size=args.batch_size,
         num_workers=NUM_WORKERS,
     )
 
     # ---- 3. Model ----
-    print("\n[3/4] Loading trained model from checkpoint...")
-    model = load_trained_model(device)
-    print(f"  Loaded weights from: {CHECKPOINT_PATH}")
+    print("\n[3/5] Loading trained model from checkpoint...")
+    model = load_trained_model(device, checkpoint_path, args.base_filters)
+    print(f"  Loaded weights from: {checkpoint_path}")
 
     # ---- 4. Inference + metrics + visualization ----
-    # run_inference now returns three arrays — true labels, hard predictions
-    # (for the discrete metrics + confusion matrix), and positive-class
+    # run_inference returns three arrays — true labels, hard predictions
+    # (for discrete metrics + confusion matrix), and positive-class
     # probabilities (for the threshold-independent ROC-AUC + curve).
-    print("\n[4/4] Running inference on the test set...")
+    print("\n[4/5] Running inference on the test set...")
     y_true, y_pred, y_probs = run_inference(model, test_loader, device)
 
-    compute_and_print_metrics(y_true, y_pred, y_probs)
-    plot_and_save_confusion_matrix(y_true, y_pred)
-    plot_and_save_roc_curve(y_true, y_probs)
+    metrics = compute_and_print_metrics(y_true, y_pred, y_probs)
+    plot_and_save_confusion_matrix(y_true, y_pred, output_path=confusion_matrix_path)
+    plot_and_save_roc_curve(y_true, y_probs, output_path=roc_curve_path)
+
+    # ---- 5. Append this run's metrics to the master CSV (Task 2) ----
+    print("\n[5/5] Logging results to experiment-tracking CSV...")
+    append_results_to_csv(args, metrics, EXPERIMENT_TRACKING_CSV)
 
     print("\nEvaluation complete.")
+
+
+# ============================================================================
+# EXPERIMENT TRACKING — Append one CSV row per HPO run (Task 2)
+# ============================================================================
+
+def append_results_to_csv(args, metrics, csv_path):
+    """
+    Append a single line summarizing this run to docs/experiment_tracking.csv.
+
+    WHY A FLAT CSV?
+        It's the simplest format pandas / Excel / plain editors all read.
+        Across a 12-cell grid search we end up with 12 rows — perfectly
+        analyzable in a spreadsheet without any infra. tune.py can also tail
+        the file mid-run to monitor progress.
+
+    SCHEMA (one row per training run):
+        run_name, lr, batch_size, base_filters,
+        accuracy, precision, recall, f1, roc_auc
+
+    The first three identify the experiment; the last five record outcomes.
+    Sorting / filtering by F1 or ROC-AUC after the fact is then a one-liner.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Carries lr, batch_size, base_filters, run_name from parse_args().
+    metrics : dict
+        Output of compute_and_print_metrics — has keys accuracy, precision,
+        recall, f1, roc_auc.
+    csv_path : str
+        Where to write. Parent dir is created on demand. Header is emitted
+        only when the file does not yet exist.
+    """
+    import csv  # Local import — only this function needs it.
+
+    # Make sure docs/ exists before opening the file in append mode.
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+
+    # Detect first-time write so we know whether to emit the header.
+    # We check existence BEFORE opening so the open() itself doesn't create
+    # an empty file and break the test on a retry.
+    file_is_new = not os.path.isfile(csv_path)
+
+    # newline='' is the official csv-module recommendation on Windows —
+    # without it, the writer's '\r\n' line terminator gets translated by the
+    # underlying text-mode handle, producing blank lines between rows.
+    with open(csv_path, mode="a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+
+        # Emit header only on first creation. If the user wipes the CSV
+        # between runs and re-runs evaluate.py, the header is restored
+        # automatically.
+        if file_is_new:
+            writer.writerow([
+                "run_name", "lr", "batch_size", "base_filters",
+                "accuracy", "precision", "recall", "f1", "roc_auc",
+            ])
+
+        writer.writerow([
+            args.run_name,
+            args.lr,
+            args.batch_size,
+            args.base_filters,
+            f"{metrics['accuracy']:.6f}",
+            f"{metrics['precision']:.6f}",
+            f"{metrics['recall']:.6f}",
+            f"{metrics['f1']:.6f}",
+            f"{metrics['roc_auc']:.6f}",
+        ])
+
+    print(f"  Appended row for run '{args.run_name}' → {csv_path}")
 
 
 # ============================================================================

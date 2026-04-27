@@ -66,6 +66,7 @@ USAGE:
 # IMPORTS
 # ============================================================================
 
+import argparse           # CLI arg parsing — replaces hardcoded HPO constants.
 import os                # Filesystem paths + makedirs for the checkpoint dir
 import sys               # Used to make the project root importable
 import time              # Per-epoch timing for the progress log
@@ -92,28 +93,18 @@ from src.model import AudioClassifier      # Our 4-block CNN with GAP head
 
 
 # ============================================================================
-# HYPERPARAMETERS — Edit these to experiment.
+# FIXED HYPERPARAMETERS — These stay constant across HPO runs.
 # ============================================================================
-
-LEARNING_RATE = 1e-3
-# Adam's step size. 1e-3 is the canonical default that works for most CNNs
-# without exploding (too large) or stagnating (too small). When tuning later,
-# the typical search range is [1e-4, 5e-3] on a log scale.
+# We deliberately do NOT expose these as CLI args because the HPO grid only
+# tunes learning rate, batch size, and base filters. Holding everything else
+# fixed isolates the effect of the swept parameters — a clean controlled
+# experiment.
 
 NUM_EPOCHS = 20
 # One "epoch" = one full pass over the training set. 20 is a reasonable
 # starting point — enough for the model to converge on a small dataset, not
-# so many that we waste compute. We'll watch validation loss to decide if
-# we need more (still improving) or fewer (already overfitting) epochs.
-
-BATCH_SIZE = 32
-# Forwarded to get_dataloaders. Larger batches give more stable gradient
-# estimates but use more VRAM. 32 is safe for almost any GPU.
-
-BASE_FILTERS = 16
-# Forwarded to AudioClassifier. Doubles every conv layer's width when
-# increased. 16 → small/fast; 32 → medium; 64 → large. Keep 16 for the
-# initial local smoke test; bump up on Colab.
+# so many that we waste compute. Early stopping will trim this further when
+# validation loss plateaus.
 
 NUM_WORKERS = 0
 # DataLoader worker processes. Keep 0 on Windows to avoid spawn-related
@@ -142,12 +133,51 @@ LR_SCHEDULER_PATIENCE = 3
 # early stopping kicks in.
 
 # --- Output paths ---
+# CHECKPOINT_DIR is shared across runs; the FILENAME inside it is built
+# inside main() from --run_name so HPO experiments don't clobber each other.
 CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "models")
-# Where best_model.pth lives. Created at runtime if missing.
 
-CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "best_model.pth")
-# Single file we overwrite each time validation loss improves. Simpler than
-# epoch-tagged filenames and matches the "track the best one" intent.
+
+# ============================================================================
+# CLI ARGUMENT PARSING
+# ============================================================================
+
+def parse_args():
+    """
+    Build the CLI arg parser for train.py.
+
+    WHY ARGPARSE INSTEAD OF HARDCODED CONSTANTS?
+        Task: support automated grid search via tune.py. The orchestrator
+        loops over (lr, batch_size, base_filters) combinations and shells
+        out to this script. Argparse is the cleanest contract between the
+        orchestrator and this script — no environment variables, no editing
+        constants between runs, no risk of a stale value carrying over.
+
+    The defaults match the previous hardcoded constants exactly so the bare
+    command `python src/train.py` reproduces the pre-HPO behaviour.
+    """
+    parser = argparse.ArgumentParser(
+        description="Train AudioClassifier with configurable hyperparameters."
+    )
+    # --lr: Adam step size. Grid search will sweep this on a log scale.
+    parser.add_argument("--lr", type=float, default=1e-3,
+                        help="Learning rate for Adam. Default: 1e-3.")
+    # --batch_size: forwarded to get_dataloaders. Bigger = more stable
+    # gradients but more VRAM. Sweep candidates: 16, 32, 64.
+    parser.add_argument("--batch_size", type=int, default=32,
+                        help="Mini-batch size. Default: 32.")
+    # --base_filters: width of the first conv layer. Doubles every block.
+    # Sweep candidates: 16 (small), 32 (medium), 64 (large).
+    parser.add_argument("--base_filters", type=int, default=16,
+                        help="Width of first conv layer. Default: 16.")
+    # --run_name: human-readable tag for THIS specific experiment. Used to
+    # name the checkpoint file so different HPO runs don't overwrite each
+    # other's weights. tune.py auto-generates one per combination.
+    parser.add_argument("--run_name", type=str, default="default_run",
+                        help="Unique tag for this run. Used in checkpoint "
+                             "and visualization filenames so HPO runs do "
+                             "not overwrite each other. Default: default_run.")
+    return parser.parse_args()
 
 
 # ============================================================================
@@ -406,12 +436,25 @@ def evaluate(model, loader, criterion, device):
 
 def main():
     """
-    Wire everything together: device → data → model → optimizer → loop →
-    checkpoint. This is what runs when you execute `python src/train.py`.
+    Wire everything together: args → device → data → model → optimizer →
+    loop → checkpoint. Runs when you execute `python src/train.py [...]`.
     """
+
+    # ---- 0. Parse CLI args (replaces the old hardcoded constants) ----
+    # We resolve hyperparameters here, at the top, so every subsequent step
+    # references args.lr / args.batch_size / args.base_filters / args.run_name.
+    args = parse_args()
+
+    # Build a per-run checkpoint path. Embedding run_name in the filename is
+    # CRITICAL during HPO — without it, every grid-search combination would
+    # save into best_model.pth and clobber the previous run's weights, making
+    # later evaluation impossible.
+    checkpoint_path = os.path.join(CHECKPOINT_DIR, f"best_model_{args.run_name}.pth")
 
     print("=" * 60)
     print("TRAINING — AudioClassifier on Log-Mel-Spectrograms")
+    print(f"  Run name:     {args.run_name}")
+    print(f"  Checkpoint:   {checkpoint_path}")
     print("=" * 60)
 
     # ---- 1. Device ----
@@ -421,7 +464,7 @@ def main():
     # ---- 2. Data ----
     print("\n[2/5] Building DataLoaders...")
     train_loader, val_loader, test_loader, class_weights = get_dataloaders(
-        batch_size=BATCH_SIZE,
+        batch_size=args.batch_size,
         num_workers=NUM_WORKERS,
     )
     # test_loader is built but not used here — final test-set evaluation
@@ -431,7 +474,7 @@ def main():
 
     # ---- 3. Model ----
     print("\n[3/5] Instantiating model...")
-    model = AudioClassifier(base_filters=BASE_FILTERS)
+    model = AudioClassifier(base_filters=args.base_filters)
     # Move EVERY parameter buffer of the model onto the compute device.
     # Must happen before constructing the optimizer — Adam captures parameter
     # references when initialized, and they need to already point at GPU
@@ -466,7 +509,7 @@ def main():
     # gradients. It's the de-facto default optimizer for new CNN projects
     # because it works well across a wide range of architectures and
     # hyperparameters without manual tuning.
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     # ---- Learning Rate Scheduler ----
     # ReduceLROnPlateau watches a metric (here, validation loss) and divides
@@ -494,8 +537,8 @@ def main():
 
     # ---- 5. Training loop ----
     print("\n[5/5] Starting training loop...")
-    print(f"  Hyperparameters: lr={LEARNING_RATE}, epochs={NUM_EPOCHS}, "
-          f"batch_size={BATCH_SIZE}, base_filters={BASE_FILTERS}")
+    print(f"  Hyperparameters: lr={args.lr}, epochs={NUM_EPOCHS}, "
+          f"batch_size={args.batch_size}, base_filters={args.base_filters}")
     print(f"  LR scheduler: ReduceLROnPlateau(factor={LR_SCHEDULER_FACTOR}, "
           f"patience={LR_SCHEDULER_PATIENCE})")
     print(f"  Early stopping patience: {EARLY_STOPPING_PATIENCE} epochs")
@@ -573,7 +616,7 @@ def main():
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_epoch = epoch
-            torch.save(model.state_dict(), CHECKPOINT_PATH)
+            torch.save(model.state_dict(), checkpoint_path)
             improved_marker = "✓ saved"
             # Reset the early-stopping counter — we're making progress again.
             epochs_since_improvement = 0
@@ -617,7 +660,7 @@ def main():
     print("-" * 95)
     print(f"\nTraining complete.")
     print(f"  Best validation loss: {best_val_loss:.4f}  (epoch {best_epoch})")
-    print(f"  Best checkpoint:      {CHECKPOINT_PATH}")
+    print(f"  Best checkpoint:      {checkpoint_path}")
     print("=" * 60)
 
 
