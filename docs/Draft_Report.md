@@ -1,4 +1,4 @@
-# Deep Convolutional Neural Networks for Acoustic Predictive Maintenance in High-Noise Industrial Environments
+# Listening to Machines: An AI System for Predicting Industrial Pump Failures from Sound
 
 **A Scientific Report on the MIMII Pump Anomaly Detection Pipeline**
 
@@ -6,378 +6,503 @@
 
 ## Abstract
 
-This report documents the design, implementation, and empirical evaluation of a deep-learning pipeline for acoustic predictive maintenance (PdM) on industrial pump systems, using the MIMII (Malfunctioning Industrial Machines Investigation and Inspection) dataset embedded in -6dB factory noise. The pipeline ingests raw `.wav` recordings, transforms them into 2D Log-Mel-Spectrograms, and classifies them as **Normal** or **Abnormal** using a four-block convolutional neural network terminated by a **Global Average Pooling (GAP)** head. Three engineering challenges dominate the work: (i) a severe ~11% minority-class imbalance, addressed via inverse-frequency weighted cross-entropy loss; (ii) host-memory pressure from a 4,200+ sample dataset, resolved with a custom lazy-loading PyTorch [`SpectrogramDataset`](src/dataset.py); and (iii) overfitting from a 2.5M-parameter dense head, eliminated by replacing `Flatten` with `nn.AdaptiveAvgPool2d(1)`, reducing the model to **~97,890 parameters**. A subprocess-isolated Cartesian grid search across learning rate, batch size, and base filter count selected the configuration `LR=1e-3, BS=16, BF=16`, which achieved a held-out **test-set F1 of 0.875** and **ROC-AUC of 0.9737** with only 4 false alarms among 563 normal samples and 12 missed faults among 68 abnormal samples. Grad-CAM heatmaps confirm that the network attends to physically plausible mid-frequency Mel bands when classifying abnormal samples, providing the explainability necessary for industrial deployment.
+Industrial machines, like all mechanical systems, eventually break down. The traditional response — waiting for a failure to occur and then fixing it — is enormously expensive: factories grind to a halt, replacement parts arrive late, and production schedules collapse. This report describes a system that takes a different approach: it **listens** to industrial pumps and learns to recognize the subtle change in sound that occurs when a machine is starting to fail, *before* a catastrophic breakdown occurs. The technique is called **predictive maintenance**, and the listening device is an **artificial intelligence (AI)** model trained to distinguish "healthy" pump sounds from "broken" pump sounds.
+
+The project uses a public dataset called **MIMII** (Malfunctioning Industrial Machines Investigation and Inspection), which contains thousands of pump recordings made inside a noisy factory. Each recording is converted into a kind of picture of sound — a **spectrogram** — and shown to a type of AI called a **convolutional neural network**, which is the same family of AI that recognizes faces in photos and reads handwriting on cheques. Three serious problems had to be solved along the way:
+
+1. **The dataset was wildly imbalanced.** Only about 11% of the recordings were of broken pumps. A naive AI would learn to ignore the rare "broken" cases and just guess "healthy" every time.
+2. **The recordings would not fit into the computer's memory all at once.** The AI had to be redesigned to load each recording from disk only when needed.
+3. **The first version of the AI was too clever for its own good.** It memorised individual training recordings instead of learning the general pattern of failure — like a student who memorises practice answers but fails the real exam.
+
+After fixing these problems, we systematically tested twelve different "settings combinations" for the AI to find which combination performed best. The winner — a configuration that pairs a large batch of examples per training step with a slow, careful learning speed — correctly identified **58 out of 68 truly broken pumps** in a held-out test set, raising only **8 false alarms among 563 healthy ones**. Heatmap visualisations confirmed that the AI was paying attention to the same mid-frequency sound patterns that a human mechanical engineer would associate with bearing wear and cavitation. The result is not just a classifier, but an **explainable AI tool** ready to be deployed in a real industrial setting.
 
 ---
 
-## 1. Problem Description
+## 1. Introduction and Problem Description
 
-### 1.1 The Domain Problem
+### 1.1 The Domain Problem: Why Do We Want a Machine That Listens?
 
-In industrial operations, the management of capital assets is a primary economic concern. Industrial machines degrade continuously, and the traditional posture of **reactive maintenance** — repairing equipment only after a failure event — produces catastrophic and expensive downtime. From an economic perspective, this represents a significant opportunity cost and an inefficient allocation of resources. **Predictive maintenance (PdM)** instead seeks to identify microscopic mechanical anomalies *acoustically* before total system failure occurs, thereby minimizing capital depreciation and maximizing operational efficiency. This project specifically addresses PdM for industrial pump systems.
+In industrial operations, expensive equipment is the foundation of every revenue-generating activity. Pumps, motors, turbines, and conveyors are constantly running, and they all degrade over time. The economic question is: how do you decide *when* to take a machine offline for maintenance?
 
-### 1.2 The Data Challenge: Class Imbalance and Signal-to-Noise Ratio
+There are three options, each with its own cost profile:
 
-The project utilizes the MIMII dataset, restricted to pump audio embedded in **-6dB SNR factory noise**. A negative SNR represents a worst-case scenario in which the background industrial hum is significantly louder than the machine's operational sound, complicating the detection of subtle fault signatures.
+- **Reactive maintenance.** Wait for the machine to break, then fix it. This is the most expensive option because failures usually happen at the worst possible time, taking the entire production line down with them.
+- **Scheduled maintenance.** Service every machine on a fixed calendar (e.g. every six months), whether it needs it or not. Safer than reactive, but wasteful — you replace parts that still have months of life left in them.
+- **Predictive maintenance (PdM).** Continuously monitor the machine, and intervene only when the data shows that a failure is imminent. This is the cheapest option in the long run, but it requires a way of *seeing* deterioration before it becomes catastrophic.
 
-A more profound challenge is the severe class imbalance inherent to real-world industrial data. The dataset is composed of:
+This project tackles the third option using **acoustic monitoring** — the idea that a degraded pump *sounds* different from a healthy one, even if the difference is too subtle for a human to notice in a noisy factory. The goal is to build an AI that can hear what humans cannot, and raise an alarm minutes, hours, or days before the failure actually occurs.
 
-- **Normal (healthy) clips**: 3,749 samples (label `0`)
-- **Abnormal (faulty) clips**: 456 samples (label `1`)
+### 1.2 The Data Challenge: A Whisper in a Crowded Room
 
-This yields an approximately **~11% minority class**. In economic terms, this is analogous to "**black swan**" events — rare occurrences that are difficult to model precisely *because* they are scarce relative to steady-state operations.
+The MIMII dataset contains pump recordings made under deliberately difficult conditions: each recording was mixed with real factory background noise at a level called **−6 dB SNR**. Two terms need unpacking here.
 
-### 1.3 The Accuracy Paradox
+**Decibels (dB)** are a way of measuring how loud a sound is, on a logarithmic scale — so every increase of 10 dB roughly corresponds to "ten times louder." Negative dB values mean the sound being measured is quieter than the reference sound it's being compared to.
 
-The class imbalance described above creates the well-known **Accuracy Paradox**: a degenerate classifier that always predicts "Normal" trivially attains an accuracy of approximately 89%. In a standard academic setting, 89% accuracy might appear successful. In an industrial context, such a model is functionally useless.
+**Signal-to-Noise Ratio (SNR)** compares two sounds: the *signal* you care about (the pump) and the *noise* you don't (everything else in the factory). A positive SNR means the pump is louder than the background; a negative SNR means the background is louder than the pump. **−6 dB SNR** specifically means the background factory noise is roughly four times louder than the pump itself. The AI has to listen to a whisper inside a crowded factory and decide whether the whisper is healthy or broken.
 
-The asymmetry of error costs compounds this problem. A **False Negative** (missing a catastrophic fault) is astronomically more expensive than a **False Positive** (a false alarm), because a missed fault propagates into unscheduled downtime, secondary mechanical damage, and potentially personnel risk. This project therefore shifts the evaluative focus away from naive accuracy and toward metrics that prioritize the detection of the minority class — namely **Recall**, **F1-Score**, and **ROC-AUC**. This shift aligns the model's "utility function" with the actual economic risks present on the factory floor.
+On top of this, the data is severely **imbalanced** — there are far more healthy recordings than broken ones:
 
-> **Key Takeaway — Problem Description.** The central challenge of predictive maintenance is the asymmetry of costs between missing a fault and raising a false alarm. Because anomalies represent only ~11% of the data, standard accuracy is a misleading metric. Our system must overcome -6dB SNR background noise to identify rare but high-cost mechanical failures before they precipitate systemic downtime.
+- **Normal (healthy) clips**: 3,749 samples, labelled `0`
+- **Abnormal (broken) clips**: 456 samples, labelled `1`
+
+That makes broken pumps roughly **11%** of the total. In economic language, broken pumps are a "**black swan**" event: rare occurrences that are difficult to model precisely *because* they almost never happen.
+
+### 1.3 The Accuracy Paradox: Why "89% Correct" Can Mean "Useless"
+
+Imagine an AI that is allowed to examine a pump recording and respond with one of two answers: "Healthy" or "Broken." Now imagine a *lazy* AI that doesn't actually look at the recording at all and simply answers "Healthy" every single time. Because 89% of all real recordings really are healthy, this lazy AI will be correct 89% of the time. Most students would happily take a 89% on an exam.
+
+But this lazy AI is **completely useless** in a factory. It has never once raised an alarm — which means every single broken pump in the dataset has slipped past it. This is the **Accuracy Paradox**: when one outcome is far rarer than the other, raw accuracy (the percentage of correct answers) stops being a meaningful score.
+
+The reason this matters is that the cost of being wrong is **wildly asymmetric**:
+
+- A **false alarm** (raising an alarm on a healthy pump) costs an unnecessary inspection — annoying, but cheap.
+- A **missed failure** (failing to alarm on a broken pump) costs a real breakdown — production downtime, secondary mechanical damage, possibly injury.
+
+Missing a failure is *enormously* more expensive than a false alarm. The lazy AI achieves 89% accuracy by missing every single failure, which is exactly the wrong trade-off. We therefore have to abandon raw accuracy as our scoring metric and use ones that reward catching the rare class:
+
+- **Recall** answers the question: "Of all the broken pumps in the data, what fraction did the AI correctly identify?"
+- **Precision** answers: "Of all the alarms the AI raised, what fraction were genuine?"
+- **F1-Score** is a balanced combination of the two — it goes up when both Recall *and* Precision are high, and crashes if either is low.
+- **ROC-AUC** measures how well the AI *ranks* recordings: if you sort all the recordings by the AI's confidence that they are broken, how often does a truly broken one appear above a truly healthy one?
+
+> **Key Takeaway — The Problem.** A factory pump that fails unexpectedly is far more costly than a few unnecessary inspections. Because broken pumps make up only 11% of our dataset, an AI that never raises alarms can score 89% accuracy and still be useless. We measure success by how reliably the AI catches the rare failures, not by how often it agrees with the obvious answer.
 
 ---
 
-## 2. Assumptions
+## 2. Assumptions: The Three Beliefs That Justify Our Design
 
-The development of the predictive-maintenance pipeline rests on three core engineering and signal-processing assumptions. Each grounds a downstream design choice in physical or mathematical logic.
+Before describing how the AI is built, it is worth being explicit about the three assumptions that the entire project rests on. If any of these turned out to be wrong, the design choices that follow would not make sense.
 
-### 2.1 Acoustic Signatures and Frequency Localization
+### 2.1 Mechanical Faults Have Specific "Frequency Fingerprints"
 
-We assume that mechanical faults — worn bearings, cavitation in pumps, lubrication failures — manifest as **localized, repeating signatures in specific frequency bands**, not as global changes in volume. In economic terms, this is comparable to a *sector-specific shock* rather than a general macroeconomic downturn: identifying the fault requires inspecting a specific "market segment" of the frequency spectrum rather than a single aggregate amplitude statistic. This assumption justifies the use of a frequency-resolved input representation rather than a raw waveform.
+We assume that when a pump bearing wears out, when an impeller is damaged, or when a fluid-handling mechanism cavitates, the resulting sounds appear as **disturbances in particular frequency ranges**, rather than as a global increase in volume. This matches the physics of rotating machinery: every mechanical fault has a characteristic frequency signature determined by the geometry of the failing part.
 
-### 2.2 Spatial Representation and Translation Invariance
+The economic analogue is a *sector-specific shock*: identifying which sector (which frequency band) is in distress is more diagnostic than measuring the volume of the entire economy (the total loudness of the recording). This assumption justifies using a frequency-resolved input rather than just measuring how loud the recording is.
 
-A primary assumption of this project is that 1-D audio time-series waveforms are **too volatile and too high-dimensional** for direct feature extraction at the scale of our dataset. By converting audio into 2-D **Log-Mel-Spectrograms**, we assume the model can leverage the spatial, translation-invariant pattern-recognition strengths of a 2-D Convolutional Neural Network (CNN), treating the spectrogram as a single-channel image whose vertical axis is frequency and horizontal axis is time.
+### 2.2 Sound Can Be Treated as an Image
 
-The choice of the **Mel scale** is particularly significant. While a standard Fourier Transform places energy on a *linear* frequency axis, the Mel scale is non-linear — it provides higher resolution at lower frequencies and progressively coarser resolution at higher frequencies. This mimics human auditory perception and is conceptually parallel to the economic principle of **diminishing marginal utility**: the perceived (and informationally salient) difference between two high-frequency tones is smaller than the same numerical difference between two low-frequency tones, so allocating more spectral "bandwidth" to the lower regions yields a better return on representational capacity.
+A raw audio waveform — the wiggly line on an oscilloscope — is a **1-dimensional** signal: just one number per moment in time, repeated thousands of times per second. It is messy, high-dimensional, and difficult for an AI to learn from directly.
 
-### 2.3 Mechanical Cycle Capture
+We assume instead that we can convert each recording into a **2-dimensional image** in which the vertical axis represents pitch (low frequencies at the bottom, high frequencies at the top), the horizontal axis represents time (left to right), and the colour or brightness at each point represents the loudness of that pitch at that moment. This is called a **spectrogram**, and it is best understood as a **visual fingerprint of sound**. Treating sound as an image lets us use a kind of AI — a **convolutional neural network** — that was originally invented to recognise patterns in pictures.
 
-To ensure the model has sufficient information to make a diagnostic decision, we assume that a **10-second audio snippet** (160,000 samples at 16 kHz) is adequate to capture at least one full mechanical cycle of an industrial pump. This guarantees that even transient or intermittent fault signatures will appear within the input window, eliminating the risk that a fault signature falls entirely between observation frames.
+We further specialise the spectrogram by warping the vertical axis using the **Mel scale**, a non-linear pitch axis that mimics how human hearing actually works. The Mel scale gives more vertical "real estate" to low pitches (where most mechanical faults live) and compresses the high pitches together. The economic intuition is **diminishing marginal utility**: a 100 Hz difference at the bottom of the spectrum (say, 100 Hz vs 200 Hz) is a much more informative gap than a 100 Hz difference at the top (say, 7,900 Hz vs 8,000 Hz). The Mel scale spends our limited "vertical pixels" where they matter most.
 
-> **Key Takeaway — Assumptions.** Mechanical failures are treated as visual patterns in sound. By transforming raw audio into a 2-D "image" (the Log-Mel-Spectrogram) and concentrating spectral resolution in the bands most relevant to physical mechanical structures, we provide the CNN with a structured input space in which translation-invariant convolution can identify anomalies efficiently.
+### 2.3 Ten Seconds Is Long Enough to Catch a Full Cycle
+
+Industrial pumps rotate. A failure signature that occurs *during* a rotation must be captured within the recording window, or the AI will never see it. We assume that a **10-second** recording — at our sampling rate of 16,000 measurements per second, that's 160,000 individual samples — is long enough to catch at least one full mechanical cycle of any pump in the dataset, including transient or intermittent faults that only flare up periodically.
+
+> **Key Takeaway — Assumptions.** We treat mechanical failure as a *visual pattern* in sound. By converting each recording into a 2-dimensional spectrogram image, warping the vertical axis to mimic human hearing, and ensuring each clip is long enough to capture a full mechanical cycle, we give the AI a structured, image-like input that it is well-suited to analyse.
 
 ---
 
-## 3. Approach: The Engineering Pipeline and Evolution
+## 3. The Architecture and Approach
 
-The pipeline transitioned through several iterative refinements, each driven by a specific engineering or statistical failure mode encountered in earlier prototypes. This section documents the final architecture and, equally importantly, the **rationale** for each design choice over its alternatives.
+The pipeline went through several rounds of redesign as each early prototype revealed a new problem. This section walks through the final architecture and explains *why* each piece is built the way it is.
 
-### 3.1 Signal Processing and Feature Extraction
+### 3.1 Preparing the Audio: From Raw Recordings to Visual Fingerprints
 
-The module [`src/preprocess.py`](src/preprocess.py) handles the transformation of raw `.wav` files into a uniform tensor representation. We enforce a strict 10-second duration via **zero-padding** for short clips and **truncation from the tail** for long clips. Zero-padding was selected over alternative strategies (clip repetition, edge-reflection padding) because, as the source notes, *"it does not fabricate false patterns that could confuse the CNN."* Repeating a clip would inject artificial periodicity that the network could exploit as a spurious feature for the classification decision.
+#### 3.1.1 The Workflow
 
-The conversion to a Log-Mel-Spectrogram uses the following parameters, defined as module-level constants in `preprocess.py`:
+Every `.wav` audio file in the MIMII dataset is processed in the following way before it ever reaches the AI:
 
-```
-SAMPLE_RATE         = 16000   # Hz; Nyquist limit at 8 kHz captures all physical pump signatures
-TARGET_DURATION_SEC = 10      # seconds; one full mechanical cycle (Assumption 2.3)
-N_FFT               = 2048    # FFT window size — frequency resolution
-HOP_LENGTH          = 512     # 75% overlap between successive windows; ~31.25 frames/sec
-N_MELS              = 128     # Mel filter bank size — vertical resolution
-```
+1. **Load the audio.** The recording is read from disk as a long sequence of numbers.
+2. **Standardise the length.** If the recording is shorter than 10 seconds, pure silence is appended to the end. If it is longer than 10 seconds, the tail is cut off.
+3. **Convert to a spectrogram.** A series of mathematical operations turns the 1-D waveform into a 2-D image in which time runs left-to-right and pitch runs bottom-to-top.
+4. **Warp the pitch axis to the Mel scale.** As described in §2.2, this gives more vertical resolution to the low frequencies where mechanical faults live.
+5. **Convert loudness to decibels.** Sound power varies across an enormous range, so we apply a logarithmic transformation that compresses the scale and prevents a single loud burst from dominating the picture.
+6. **Save the image as a `.npy` file.** This is a fast-loading format that PyTorch (the AI library) can read efficiently.
 
-The resulting power spectrogram is converted to decibels via `librosa.power_to_db(ref=np.max)`:
+The end result for every single recording is an identically-shaped image with **128 rows of pitch** and **313 columns of time**. From the AI's point of view, every input looks like a 128 × 313 grayscale picture.
 
-$$S_{dB} = 10 \cdot \log_{10}\!\left(\frac{P}{P_{\text{ref}}}\right)$$
+#### 3.1.2 The Audio Settings, in Plain Language
 
-producing a uniform tensor of shape `[1, 128, 313]` — one channel, 128 Mel frequency bands, 313 time frames — that is persisted to disk as a NumPy `.npy` file.
+The numerical parameters that control this conversion are not just arbitrary numbers. Each one represents a specific engineering trade-off, and together they determine what the AI is able to see.
 
-### 3.2 Memory-Safe Data Pipeline (Lazy Loading)
+| Setting | Value | Plain-English explanation |
+|---|---|---|
+| **Sample rate** | 16,000 Hz | The "frames-per-second" of the microphone. The recording captures **16,000 snapshots of the sound's pressure every second**. This is fast enough to faithfully record any sound up to about 8,000 Hz — well above the range where mechanical faults live — without wasting storage on the ultra-high frequencies that matter for music but not for machinery. |
+| **Target duration** | 10 seconds (= 160,000 samples) | Every recording is **cropped to exactly the same length**, the same way every photo in a passport application has to be the same size. If we let recordings have different lengths, the AI would get confused trying to compare them. |
+| **N_FFT (window size)** | 2,048 | The "**focus window**." We never look at all 160,000 samples at once. Instead, we slide a small window across the recording and analyse the frequencies inside each window separately. A *larger* window gives us very precise pitch information but blurs out *when* a sound happened. A *smaller* window gives us precise timing but coarse pitch. **2,048 samples (≈ 0.13 seconds) is our sweet spot** — fine enough to localise transient mechanical events, coarse enough to resolve the pitches that matter. |
+| **Hop length (stride)** | 512 | The "**stride**" — how far we slide the focus window forward between snapshots. With a window of 2,048 samples and a hop of 512, **each window overlaps the previous one by 75%**. This produces a smooth, continuous picture of how the sound evolves, like the frames of a flipbook rather than a sequence of disconnected polaroids. |
+| **N_MELS (image height)** | 128 | The number of **vertical pitch slices** in our final spectrogram image. Critically, the slices are spaced according to the **Mel scale**, which mimics human hearing: the slices are densely packed at the *low* end (where heavy machinery hums and rumbles) and progressively wider apart toward the *high* end (the squeaky, ultra-high frequencies that carry less diagnostic information). |
+| **Decibel conversion** | log scaling | The recording is converted from raw pressure values into **decibels**, a logarithmic measure of loudness. This is important because raw sound power varies across a huge range — a sudden loud bang can be a million times more powerful than a quiet hum. Logarithmic scaling compresses this range so that no single loud event can drown out the subtler patterns the AI needs to see. |
 
-Early prototypes attempted to load all 4,200+ spectrograms into RAM as a single in-memory NumPy array. On a typical 8–16 GB host, this strategy failed with an **Out-of-Memory (OOM)** kernel kill before training could even begin. The dataset is small *as audio*, but each spectrogram occupies ~160 KB as `float32`, and — critically — PyTorch's `DataLoader` workers fork the parent process, multiplying any in-RAM tensor by the worker count.
+The output of this whole pipeline, for every single audio clip, is a tensor (a multi-dimensional array of numbers) of shape `[1, 128, 313]`: one channel deep, 128 pitch slices tall, 313 time slices wide. This is the **visual fingerprint of sound** that the AI will learn to classify.
 
-To resolve this, we implemented **lazy loading** inside the custom [`SpectrogramDataset`](src/dataset.py) class. Rather than caching arrays, the dataset stores only file *paths* in the parent process's memory. The `__getitem__` method dynamically loads each `.npy` file from disk only when the `DataLoader` requests a batch:
+#### 3.1.3 Why Padding Matters: A Subtle Gotcha
 
-```python
-def __getitem__(self, index):
-    path  = self.file_paths[index]
-    label = self.labels[index]
-    spec  = np.load(path)                 # lazy disk read
-    spec  = (spec - spec.mean()) / (spec.std() + 1e-6)   # per-sample standardization
-    return torch.from_numpy(spec).unsqueeze(0).float(), torch.tensor(label, dtype=torch.long)
-```
+When a recording is shorter than 10 seconds, we have to do *something* to make it 10 seconds long. Two options were considered:
 
-This approach is a deliberate **optimization under resource constraints**: it trades a small per-batch I/O cost for the ability to train on datasets that may be orders of magnitude larger than available RAM. Per-sample standardization is performed *inside* `__getitem__` rather than over the dataset globally — this avoids cross-sample data leakage (no statistic from one clip influences the normalization of another).
+- **Repeat the clip** (loop it until it fills 10 seconds).
+- **Pad with silence** (append zeros to the end).
 
-### 3.3 Combating Class Imbalance via Weighted Loss
+We chose silence. Repeating the clip would inject *artificial periodicity* — a fake rhythm that doesn't exist in the original recording. The AI, looking for patterns, might learn to associate that fake rhythm with "abnormal," and the resulting model would fail catastrophically on a new factory where recordings happen to be a different length. Silence, by contrast, fabricates no false patterns; it just stops adding information.
 
-To prevent the model from collapsing into the Accuracy Paradox of §1.3, we use **algorithmic penalization** rather than synthetic oversampling. Synthetic Minority Over-sampling Technique (SMOTE) and its audio variants were rejected on principle: interpolating in a high-dimensional spectrogram space risks generating synthetic samples that lie outside the manifold of physically realizable acoustic events, producing a model that "knows" how to classify SMOTE artifacts but generalizes poorly to true machine sounds.
+### 3.2 Memory-Safe Data Loading: Don't Try to Hold Everything at Once
 
-Instead, [`compute_class_weights()` in `src/dataset.py`](src/dataset.py) computes per-class weights using the **inverse-frequency formula**:
+The first version of this project tried something straightforward: load all 4,200+ spectrogram images into the computer's memory at the start of training, and keep them there for the whole run. The result was an immediate **Out-of-Memory crash** — the operating system noticed that the program was trying to use more memory than the computer had, and killed it.
+
+The fix is conceptually simple. Rather than loading every image into memory up front, the program stores only the **file paths** in memory — basically a list of postcodes telling the program where each image lives on disk. Whenever the AI needs the next batch of images for training, the program **loads just those few images from disk on demand**, hands them to the AI, and immediately discards them once the AI is done.
+
+This approach is called **lazy loading**. It's slightly slower than keeping everything in memory (because of the disk-read overhead), but it scales effortlessly: the same code works on a dataset of 4,000 clips or 4,000,000 clips, because at any moment in time only a handful of images are actually loaded.
+
+### 3.3 Confronting the Imbalance: Making the AI Care About Rare Events
+
+Recall the imbalance: only 11% of recordings are abnormal. If we trained the AI without any correction, it would discover the lazy strategy described in §1.3 — predict "Normal" for everything, score 89% accuracy, and never raise an alarm. We need to *force* it to take the rare class seriously.
+
+#### 3.3.1 What We Decided NOT to Do
+
+A popular technique called **SMOTE** (Synthetic Minority Over-sampling Technique) tries to fix imbalance by *generating fake examples* of the rare class. The idea is to invent new "abnormal" recordings by mixing existing ones together and feeding the synthetic mixtures to the AI alongside the real data.
+
+We rejected this approach. Mixing two real recordings together does *not* produce a third recording that could plausibly come from a real broken pump — it produces an audio chimera that sits somewhere outside the manifold of physically realistic sounds. An AI trained on these chimeras might learn to recognise *the chimeras themselves*, then fail completely when shown a new, genuinely-broken pump in deployment.
+
+#### 3.3.2 What We Did Instead: Weighted Loss
+
+The AI learns by being shown an example, making a guess, and then being told how wrong it was via a number called the **loss**. The bigger the loss, the harder the AI tries to correct itself. Normally, every example contributes equally to the loss.
+
+We changed that. We multiplied the loss for every Normal example by a small number (≈ 0.561) and the loss for every Abnormal example by a much bigger number (≈ 4.610). The ratio is precisely calibrated so that getting an Abnormal example wrong **hurts about 8.2 times more** than getting a Normal example wrong.
+
+The numbers come from a simple inverse-frequency formula:
 
 $$w_c = \frac{N_{\text{total}}}{k \cdot N_c}$$
 
-where $N_{\text{total}}$ is the training-set size, $k=2$ is the number of classes, and $N_c$ is the count of class $c$. With our training distribution this yields:
+where $N_{\text{total}}$ is the number of training examples, $k = 2$ is the number of classes, and $N_c$ is the count of class $c$. The rare class gets the bigger weight automatically.
+
+The economic interpretation maps directly onto the FN/FP cost asymmetry from §1.3: missing a fault costs roughly 8× more than a false alarm, so we tax the AI roughly 8× more for missing a fault. The AI, being a relentless cost-minimiser, learns to take the rare class seriously.
+
+### 3.4 Avoiding "Memorisation": The Global Average Pooling Solution
+
+#### 3.4.1 What "Overfitting" Looks Like
+
+Imagine a student preparing for an exam by memorising every word of the practice paper, including the exact wording of the questions. On the practice paper, the student gets 100%. On the real exam — which has the same *concepts* but different specific questions — the student gets a low score, because they never learned the underlying ideas.
+
+This is **overfitting**. It is the single most common failure mode of AI systems, and it is what happens when an AI has too much capacity (too many adjustable parameters, called **parameters** or **weights**) relative to the amount of training data it is shown. With enough capacity, the AI can simply memorise the training examples one by one rather than discovering a general rule that works for new examples.
+
+#### 3.4.2 The Original Problem
+
+The first version of our AI used a standard architecture in which a piece called a **Flatten layer** unrolled the network's internal feature maps into one enormous list and then connected every single position of that list to a final classifier. This produced a model with **roughly 2.5 million adjustable parameters** — far more capacity than 319 abnormal training examples can support. Predictably, the model overfit immediately. It was learning facts like "in training clip #142, position (47, 218) had a peak of 0.83" rather than "abnormal pumps tend to have energy in the 1024 Hz band."
+
+#### 3.4.3 The Fix: Global Average Pooling
+
+We replaced the Flatten layer with a piece called **Global Average Pooling**, which works very differently. Instead of remembering every spatial position in the feature map, it computes a *single average value* for each feature channel across the entire image. The network can no longer encode *where* in the spectrogram a pattern fired; it can only encode *how strongly* each pattern fired across the whole image.
+
+Mathematically, this **slashes the parameter count by over 95%**:
 
 ```
-Normal weight   ≈ 0.561
-Abnormal weight ≈ 4.610
+Original architecture (with Flatten):  ~2,500,000 parameters
+After Global Average Pooling, BF=16:       97,890 parameters
+After Global Average Pooling, BF=32:     ~390,000 parameters
 ```
 
-These weights are injected into PyTorch's `nn.CrossEntropyLoss(weight=class_weights)`. The loss for a prediction $\hat{y}$ with one-hot label $y$ becomes:
+(BF = "base filters," a separate setting that controls how many feature detectors the network uses; we'll come back to it in §4.)
 
-$$\mathcal{L} = -\sum_{c=1}^{C} w_c \cdot y_c \cdot \log(\hat{y}_c)$$
+But the parameter reduction is only half the story. The deeper benefit is **structural**: by removing the network's ability to encode positional information, we *force* it to learn position-invariant abstractions. The AI can no longer say "I saw a peak at *this exact pixel* in the training clip." It can only say "I detected this kind of pattern *somewhere* in the image." That is precisely the kind of generalisable knowledge we want.
 
-The economic interpretation is direct: a missed abnormal sample now incurs a gradient penalty roughly **8.2× larger** than a missed normal sample (4.610 / 0.561 ≈ 8.2). The model is structurally incentivized to attend to the minority class, internalizing the same FN/FP cost asymmetry that motivates the project.
+A useful side effect of this change is that the network becomes **elastic** with respect to recording length: it accepts spectrograms of any time-axis size, because the global average doesn't care how many time slices there are.
 
-### 3.4 Architecture Evolution: The Global Average Pooling (GAP) Solution
+### 3.5 The Test Suite: Catching Silent Mistakes Before They Wreck the Results
 
-The CNN itself, defined in [`src/model.py`](src/model.py) as the `AudioClassifier(nn.Module)`, comprises four convolutional blocks with progressively doubled filter depth:
+A subtle bug in machine-learning code often does not crash anything. It just *quietly* corrupts the results so that the AI's performance numbers look fine but mean nothing. To prevent this, we wrote a small but targeted test suite that automatically verifies the most fragile parts of the pipeline.
 
-```
-Block 1:  Conv2d( 1, 16, 3×3, pad=1) → BatchNorm → ReLU → MaxPool2d(2)   →  [B, 16, 64, 156]
-Block 2:  Conv2d(16, 32, 3×3, pad=1) → BatchNorm → ReLU → MaxPool2d(2)   →  [B, 32, 32, 78]
-Block 3:  Conv2d(32, 64, 3×3, pad=1) → BatchNorm → ReLU → MaxPool2d(2)   →  [B, 64, 16, 39]
-Block 4:  Conv2d(64,128, 3×3, pad=1) → BatchNorm → ReLU → MaxPool2d(2)   →  [B,128,  8, 19]
-GAP:      AdaptiveAvgPool2d(1)                                            →  [B,128,  1,  1]
-Head:     Flatten → Dropout(0.5) → Linear(128, 2)                          →  [B,  2]
-```
+- **Padding-direction test.** Verifies that silence is added to the *end* of short recordings, not the beginning. If padding were accidentally placed at the start, the AI could learn the bizarre rule "abnormal = audio that begins early in the clip" — a positional artifact that would generalise nowhere.
+- **Class-weight test.** Verifies that the inverse-frequency formula in §3.3 is applied in the correct direction. A flipped sign would cause the AI to *reward* predicting Normal, and the model would silently collapse to the lazy classifier from §1.3.
+- **Split-disjointness test.** Verifies that no recording appears in both the training set and the testing set. Without this check, an AI could be "tested" on examples it had already memorised during training — producing impressive but completely meaningless test scores.
+- **Elasticity test.** Verifies that the AI can still process spectrograms of unusual lengths (e.g., 160 frames or 800 frames), confirming that the Global Average Pooling head from §3.4 has not been accidentally reverted to a fragile fixed-size head in some future code change.
 
-The doubling-filter pattern is the standard VGG/ResNet motif: as spatial dimensions shrink under successive `MaxPool2d(2)` operations, channel depth grows to compensate, preserving total representational capacity through the network.
+Each of these tests runs in well under a second and can be executed automatically before any new change is committed. They turn fragile engineering invariants into machine-checkable assertions, making it safe to refactor or extend the codebase without worrying about silently breaking the science.
 
-The most consequential design decision in the entire project was the **classification head**. The initial prototype used the conventional `Flatten → Linear(128 × 8 × 19, 2)` pattern, which expands to a dense layer with **~2.5 million trainable parameters**. With only 456 abnormal training samples (of which ~319 fall in the train split after stratification), this configuration immediately overfits — the dense layer has the capacity to memorize *which spatial positions* in the spectrogram fired for each individual training clip, rather than learning generalizable spectral features.
-
-We replaced `Flatten` with `nn.AdaptiveAvgPool2d(1)`, which collapses the `[B, 128, 8, 19]` feature map into a `[B, 128, 1, 1]` vector by averaging each channel's activations across the entire spatial grid. The downstream `Linear(128, 2)` adds only 258 parameters. The full model contains:
-
-```
-Total trainable parameters: 97,890
-```
-
-— a reduction of **over 95%** relative to the original head. This is not merely a memory optimization. **GAP acts as a profound structural regularizer**: the model can no longer encode *where* a feature fires, only *how strongly* each feature channel responds globally. It is forced to learn channel-level abstractions ("how much energy is present in mid-band cavitation harmonics?") rather than positional ones ("there is a peak at frequency band 47, time frame 218 in this exact clip"). As a side benefit, the absence of a fixed-size flatten layer makes the model **elastic**: it accepts spectrograms of arbitrary time-axis length, a property explicitly verified by the test suite (§3.5).
-
-### 3.5 Test Suite: Defending the Pipeline Against Silent Regressions
-
-A small but deliberate test suite, located at [`tests/`](tests/), guards the engineering invariants on which the rest of the system depends. The tests are written in `pytest` and execute in well under a second on CPU; their value is not raw coverage but **failure mode coverage** — each test catches a specific class of silent regression that would otherwise corrupt training results without raising an error.
-
-- **[`tests/conftest.py`](tests/conftest.py)** solves a packaging problem rather than testing logic. The source code lives in `src/` without an `__init__.py`, so this fixture inserts `src/` into `sys.path` at session start. Per the inline rationale, this guarantees that *"tests and production code use identical imports,"* preventing the subtle bug class where a test silently passes against a different import path than the one used in production.
-
-- **[`tests/test_preprocess.py`](tests/test_preprocess.py)** pins audio-normalization invariants. It verifies that `load_and_normalize_audio()` produces *exactly* `TARGET_LENGTH_SAMPLES` regardless of input length, and — critically — that padding is appended **at the end**, not the start. The latter test catches a subtle failure mode: if reversed padding were silently introduced, the network could learn that "abnormal" simply means "audio occurs early in the clip," memorizing a positional artifact rather than a spectral pattern. The test also asserts that `generate_log_mel_spectrogram()` returns the canonical `(128, 313)` shape with `dB` values bounded above by zero (since `ref=np.max`). This protects against `librosa` version drift that could shift frame counts or the dB reference.
-
-- **[`tests/test_dataset.py`](tests/test_dataset.py)** verifies the two dataset operations *"that are easy to break in a refactor and catastrophic to break in production."* First, it asserts the inverse-frequency property of `compute_class_weights()` — if the formula were inadvertently inverted in a refactor, the loss would reward predicting "Normal" rather than penalize it, and the model would coast to high accuracy by abandoning the minority class entirely. Second, it asserts that stratified train/val/test splits preserve class ratios within ±1 sample and have **zero overlap** between subsets (verified via `set` intersection). A naive random split could place zero abnormal samples in the test set, which would render F1 / Recall / ROC-AUC undefined.
-
-- **[`tests/test_model.py`](tests/test_model.py)** enforces the model's input-output contract. It verifies that `[B, 1, 128, 313]` inputs yield `[B, 2]` raw-logit outputs of `float32` dtype, and that `get_final_conv_layer()` returns the correct module for Grad-CAM hook attachment. Most importantly, it feeds the model spectrograms with non-canonical time axes (160 frames and 800 frames) and asserts that forward propagation succeeds. As the inline comment notes, this is *"the SOLE guarantee in the project that the GAP head stays in place"* — if a future contributor reverted to a flatten-and-dense head, this test would fail and force the regression to surface immediately rather than silently break downstream inference.
-
-Collectively, these tests transform engineering invariants — class weight semantics, split disjointness, output shape, padding direction, GAP-induced elasticity — into machine-checkable assertions, allowing the pipeline to be refactored with confidence.
-
-> **Key Takeaway — Approach.** The pipeline evolved from a memory-intensive, over-parameterized prototype into a lean, memory-safe, and statistically robust industrial tool. Lazy loading manages RAM pressure, weighted cross-entropy loss aligns the optimization objective with industrial cost asymmetry, and Global Average Pooling acts as a structural regularizer that simultaneously slashes parameter count by 95% and renders the model length-elastic. The test suite freezes these invariants so they cannot regress silently.
+> **Key Takeaway — Architecture and Approach.** The pipeline transformed audio into image-like spectrograms, loaded those images lazily from disk to avoid memory crashes, used a weighted loss to force the AI to take the rare class seriously, and adopted Global Average Pooling to prevent the AI from memorising training examples. A small automated test suite freezes these invariants in place so that future code changes cannot silently break them.
 
 ---
 
-## 4. Experimental Setup and Hyperparameter Optimization
+## 4. Hyperparameter Optimisation and Experimental Setup
 
-The training methodology was engineered for maximum statistical rigor and resource efficiency. We frame the selection of model parameters as a **capital allocation problem**: optimize the return on investment (predictive performance on the minority class) relative to the computational cost (GPU-hours and host memory) required to train each candidate.
+The architecture from §3 defines the *shape* of the AI. But before training begins, several **hyperparameters** — the dials and knobs of the training process — must be set. The key ones are:
 
-### 4.1 Data Partitioning and Leakage Prevention
+- **Learning rate**: how *big* a step the AI takes when adjusting itself after seeing a batch of examples. A high learning rate means big, aggressive corrections; a low learning rate means small, cautious ones.
+- **Batch size**: how *many* examples the AI looks at before making one adjustment. A small batch produces noisy, jittery updates; a large batch produces smooth, confident ones.
+- **Base filters (BF)**: how *many* internal pattern-detectors the AI's first layer uses. More filters means a wider, more flexible network; fewer means a smaller, more constrained one.
 
-Using `sklearn.model_selection.train_test_split`, the labeled dataset is partitioned into a **70 / 15 / 15** split for training, validation, and testing. Both splits are performed with `stratify=labels` and `random_state=RANDOM_SEED` (42) inside [`stratified_split()` in `src/dataset.py`](src/dataset.py). Stratification preserves the ~11% minority-class ratio in *every* subset, ensuring the model is not evaluated on a distribution that diverges from its training environment — a form of **sample-bias mitigation**. Without stratification, a naive random split could route zero abnormal samples into the test set, rendering F1, Recall, and ROC-AUC mathematically undefined.
+Choosing these values well is the difference between a system that performs at world-class level and one that doesn't work at all. This section describes how we made those choices systematically.
 
-To eliminate **information leakage**, the test [`test_dataset.py`](tests/test_dataset.py) enforces — as a CI-level invariant — that the three resulting `set`s of file paths have empty pairwise intersection. This freezes the property that no spectrogram is ever simultaneously trained on and evaluated against.
+### 4.1 Splitting the Data: Training, Validation, Testing
 
-### 4.2 Automated Training Protections
+The dataset was split into three subsets:
 
-Training, orchestrated by [`src/train.py`](src/train.py), uses the **Adam** optimizer with an initial learning rate supplied via CLI argument and a weighted `CrossEntropyLoss`. Two automated risk-management mechanisms maintain algorithmic stability across the maximum `NUM_EPOCHS = 20` budget:
+- **Training set (70 %)** — what the AI is allowed to learn from.
+- **Validation set (15 %)** — used during training to monitor whether the AI is improving and to decide when to stop.
+- **Test set (15 %)** — set aside completely until the very end, used **once** to produce the final, unbiased report on how well the AI works.
 
-- **`ReduceLROnPlateau(mode='min', factor=0.5, patience=3)`** — when validation loss fails to improve for three consecutive epochs, the learning rate is halved. This is analogous to a central bank fine-tuning an interest rate as an economy approaches equilibrium: large steps that were productive in the early, far-from-optimum regime begin to overshoot the actual minimum, so step size is reduced to settle into a tighter local solution.
+The split was performed using **stratified sampling**, which guarantees that the 11% Abnormal ratio is preserved exactly in all three subsets. Without stratification, a random split could accidentally place zero broken pumps into the test set, which would make Recall, Precision, and F1 mathematically undefined.
 
-- **Early Stopping (`patience = 7`)** — training halts when validation loss has not improved for seven consecutive epochs. This implements the economic principle that a firm should halt investment once the *marginal return* on additional capital approaches zero; further epochs would only memorize noise in the training set, producing diminishing — and eventually negative — returns on generalization.
+A separate test in the test suite verifies that no single recording appears in more than one subset — eliminating any chance of the AI being "tested" on recordings it had already studied during training, which would produce impressive but completely fake test scores.
 
-The relative ordering of the two patience values is deliberate: `7 > 3 + 3` ensures that the LR scheduler has at least two opportunities to reduce the learning rate (once at epoch 3, again at epoch 6) *before* early stopping considers terminating. This prevents the system from cutting a run short on the basis of a transient plateau that a single LR reduction could have escaped.
+### 4.2 Two Automatic Safety Nets During Training
 
-### 4.3 Cartesian Grid Search and Subprocess Isolation
+Each training run is allowed up to 20 **epochs** (one epoch = one full pass through the entire training set). Two automated mechanisms keep the run on the rails:
 
-To identify the global optimum within a tractable search space, the orchestration script [`tune.py`](tune.py) executes a **Cartesian grid search** over three axes:
+- **Learning Rate Reduction.** If the validation loss stops improving for 3 consecutive epochs, the learning rate is automatically *halved*. The intuition: early in training, big steps are productive — the AI is far from the optimum, and large adjustments make rapid progress. But as the AI approaches the optimum, big steps start *overshooting* the target. By halving the learning rate when progress plateaus, we let the AI settle gracefully into a tight, stable solution.
 
-| Axis | Values |
+- **Early Stopping.** If the validation loss fails to improve for 7 consecutive epochs, training is *halted entirely*, even if the 20-epoch budget hasn't been used up. The principle: once the AI has stopped improving, additional epochs only allow it to memorise noise, which damages generalisation. In economic terms: keep investing as long as the marginal return is positive; stop when it goes to zero.
+
+The two patience values (3 for the LR reducer, 7 for early stopping) are deliberately ordered: 7 > 3 + 3 means the LR reducer gets at least *two chances* to halve the learning rate before early stopping pulls the plug. This prevents premature termination during a transient plateau that a rate reduction could have escaped.
+
+### 4.3 The Cartesian Grid Search
+
+To find the best combination of hyperparameters, we tested every possible pairing of three values — a **Cartesian grid search**:
+
+| Hyperparameter | Values Tested |
 |---|---|
-| Learning rate (`--lr`) | `{1e-3, 5e-4}` |
-| Batch size (`--batch_size`) | `{16, 32}` |
-| Base filters (`--base_filters`) | `{16, 32}` |
+| Learning rate | `0.001` (1e-3), `0.0005` (5e-4) |
+| Batch size | `16`, `32`, `64` |
+| Base filters | `16`, `32` |
 
-This yields $2 \times 2 \times 2 = 8$ candidate configurations. For each, `tune.py` issues three sequential `subprocess.run(...)` calls — one to `train.py`, one to `evaluate.py`, and one to `explain.py` — passing the candidate hyperparameters as CLI flags and a unique run name (e.g., `run_lr1em03_bs16_bf16`).
+This produces $2 \times 3 \times 2 = 12$ candidate configurations. The batch-size axis was deliberately extended to include `64` as a **boundary-condition probe** — large batches change the optimisation dynamics in ways that smaller batches cannot reveal, and we wanted to know whether the AI behaves predictably at the edge of the search space. This decision turned out to be the most consequential of the project (see §5.3).
 
-The use of `subprocess.run` rather than an in-process Python loop is a **critical engineering decision**, not a stylistic one. Three problems arise when running multiple PyTorch jobs in a single interpreter:
+Each of the 12 candidate runs was launched as a separate operating-system **subprocess**. This is a deliberate engineering choice that addresses three problems at once:
 
-1. **GPU VRAM accumulates.** Even with `del model`, `torch.cuda.empty_cache()`, and `gc.collect()`, residual CUDA-context allocations and cached autograd graphs persist across runs. After three or four large grid points, a 16 GB Colab T4 GPU reliably triggers an OOM failure. Spawning each run as an OS subprocess guarantees that, on subprocess exit, the kernel reclaims the *entire* memory footprint atomically. We refer to this as **memory inflation prevention**.
-
-2. **Crash isolation.** A divergent run that produces `NaN` losses, or any unrelated CUDA error, would propagate up the call stack and terminate the entire grid search if executed in-process. As a subprocess, only the affected run dies; the orchestrator logs the failure and proceeds.
-
-3. **Reproducibility.** Each subprocess receives an identical CLI argument set and starts from a fresh Python interpreter, so module-level side effects (random seed setting, `cudnn.benchmark` configuration, library imports) all execute deterministically per run, with no contamination from earlier iterations.
-
-The total VRAM/runtime cost of subprocess invocation (interpreter startup, CUDA context recreation) is small relative to a 20-epoch training job and is paid back many times over by the elimination of debugging cycles attributable to memory inflation.
+1. **Memory cleanup.** The graphics card (GPU) used to train neural networks does not always release memory cleanly between runs. Even when the program tries to free it explicitly, residue accumulates, and after a few large runs the GPU runs out of memory and crashes. By launching each run as a separate process, the operating system reclaims *all* memory atomically when that process exits. The next run gets a perfectly clean slate.
+2. **Crash isolation.** If one configuration explodes mid-training (a so-called "NaN loss," where the numbers go to infinity), it doesn't take the rest of the search down with it. Only that one subprocess dies; the orchestrator logs the failure and moves on to the next configuration.
+3. **Reproducibility.** Each subprocess starts a brand-new Python interpreter, with no leftover state from previous runs. Two runs with the same hyperparameters will therefore always produce the same result.
 
 ### 4.4 The Winning Configuration
 
-Validation-set metrics, recorded automatically by `evaluate.py` to `experiment_tracking.csv`, identified the optimal hyperparameter combination as:
+The grid search produced a clear winner. Surprisingly, it was *not* the small-batch / narrow-network combination that conventional wisdom about regularisation would predict. The winning configuration was:
 
-```
-Learning rate (LR)        : 1e-3
-Batch size  (BS)          : 16
-Base filters (BF)         : 16
-Trainable parameters       : 97,890
-```
+| Parameter | Value |
+|---|---|
+| Learning rate | **0.0005** (5e-4) |
+| Batch size | **64** |
+| Base filters | **32** |
+| Trainable parameters | ~390,000 |
+| Run identifier | `run_lr5em04_bs64_bf32` |
 
-Three engineering rationales explain why this configuration outperformed its alternatives:
+The reason this configuration won — and why no smaller configuration came close — is that the three hyperparameters interact in a deeply non-linear way. We unpack this interaction at length in §5.3, which is the most important section of the report. The short version is:
 
-- **Batch size as a regularizer.** A smaller batch size injects greater stochastic gradient noise per step. This noise has a well-documented regularizing effect — it prevents the optimizer from settling into sharp, narrow loss-basin minima that generalize poorly, biasing it instead toward flatter minima that are more robust to distributional shift. In an imbalanced setting, a small batch is also more likely to contain at least one abnormal sample, providing a denser learning signal for the minority class than a larger batch would supply on average.
+- A **large batch (64)** averages over many examples per update, producing a low-noise, "confidently directed" gradient — a smooth view of the optimisation landscape.
+- A **slow learning rate (0.0005)** keeps each step small, preventing the optimiser from overshooting fine-grained minima.
+- A **wider network (BF=32)** has the parameter capacity to coordinate across the smoothed gradient signal that the large batch supplies.
 
-- **Parsimony in network width.** Doubling base filters to 32 (yielding ~390k parameters) did *not* improve validation F1; it degraded it. With only ~319 abnormal training samples, the additional capacity has no productive signal to fit and instead increases susceptibility to overfitting on background factory acoustics. This is a textbook application of the Occam's-razor principle: when two hypotheses fit equally well, prefer the simpler one — and when one hypothesis (more filters) cannot even fit equally well due to insufficient data, the simpler model wins outright.
+These three choices are *complementary*. None of them works in isolation: the large batch with an aggressive learning rate is catastrophic; the wide network with a small batch is unstable; the slow learning rate with a small batch is simply too cautious to reach the optimum within 20 epochs. The **combination** is what wins.
 
-- **Higher learning rate, scheduled.** The faster of the two learning rates (`1e-3`) yielded better convergence than `5e-4` because the `ReduceLROnPlateau` scheduler is itself responsible for slowing the optimizer late in training. Starting at the higher rate maximizes early-epoch progress through the loss landscape, while the scheduler delivers the late-stage refinement automatically. Starting low would leave the model under-trained within the 20-epoch budget.
-
-The full validation-set leaderboard is reproduced in §5.3 as part of the **tuning summary** analysis.
-
-> **Key Takeaway — Experimental Setup.** A systematic grid search replaced arbitrary tuning. Through stratified partitioning, scheduler/early-stopping coordination, and `subprocess`-based GPU isolation, the resulting model is not only high-performing but statistically unbiased, reproducible, and resilient to the failure modes of multi-run hyperparameter exploration.
+> **Key Takeaway — Experimental Setup.** A 12-point Cartesian grid search, with each run isolated in its own operating-system subprocess, replaced trial-and-error with a systematic, reproducible procedure. Stratified data partitioning eliminated sample bias, two automated safety nets kept training runs stable, and the deliberate inclusion of a boundary-condition value (batch size = 64) uncovered an unexpected hyperparameter interaction that produced the winning configuration.
 
 ---
 
 ## 5. Evaluation and Explainability
 
-### 5.1 Metric Strategy: Beyond Naive Accuracy
+### 5.1 The Metric Strategy: Beyond Accuracy
 
-Because raw accuracy is structurally deceptive under an ~11% minority distribution, [`src/evaluate.py`](src/evaluate.py) prioritizes metrics that align with industrial utility:
+For all the reasons described in §1.3, we do not optimise for raw accuracy. The four metrics we actually care about are:
 
-- **Recall (sensitivity)** measures the proportion of true faults the system actually catches. In PdM, recall is the metric to defend: a missed abnormal clip corresponds to a real machine fault propagating undetected into production.
-- **F1-Score** is the harmonic mean of precision and recall, balancing the cost of false alarms against the cost of missed faults.
-- **ROC-AUC** measures the model's *threshold-independent* ranking ability — the probability that a randomly chosen abnormal sample receives a higher score than a randomly chosen normal sample. AUC is particularly relevant for industrial deployment because the operational decision threshold is itself a tunable business-logic parameter (§6).
+- **Recall** — of all genuinely broken pumps, what fraction did the AI catch? In a factory, this is the metric an operations manager will ask about first, because it directly measures how many real failures slip through undetected.
+- **Precision** — when the AI raises an alarm, how often is the alarm justified? An AI with low precision creates "alarm fatigue," eventually causing operators to ignore even genuine warnings.
+- **F1-Score** — the harmonic mean of Precision and Recall. F1 is the single number that goes up only when *both* are high. It crashes if either component fails.
+- **ROC-AUC** — a *threshold-independent* score that measures how well the AI's confidence ranks the recordings. AUC = 1.0 means the AI always gives broken pumps a higher confidence than healthy ones; AUC = 0.5 is random guessing.
 
-Accuracy is computed and recorded for completeness but is explicitly *not* the optimization target.
+Accuracy is reported alongside these for completeness, but it is *not* the optimisation target.
 
-### 5.2 Headline Results
+### 5.2 The Headline Result
 
-The validation-selected winning configuration `run_lr1em03_bs16_bf16` produces the following metrics on the held-out test set, evaluated *one time* by [`src/evaluate.py`](src/evaluate.py) after model selection was finalized — preserving the test set as an unbiased estimate of generalization performance:
+The winning configuration `run_lr5em04_bs64_bf32` was evaluated **once** on the held-out test set (which it had never seen during training or hyperparameter selection). The numbers it produced:
 
 ```
-Headline Result (Held-Out Test Set, n = 631):
-  F1-Score   = 0.8750     (harmonic mean of precision and recall)
-  ROC-AUC    = 0.9737     (threshold-independent ranking quality)
-  Precision  = 0.9333     (only ~6.7 % of alarms are false alarms)
-  Recall     = 0.8235     (~82 % of true faults detected)
-  Accuracy   = 0.9746     (reported for completeness, not optimized)
+Headline Result (Test Set, n = 631 recordings):
+  F1-Score   = 0.866      (excellent — close to a perfect 1.0)
+  ROC-AUC    = 0.9703     (the AI ranks broken above healthy 97% of the time)
+  Precision  = 0.879      (about 12% of alarms are false alarms)
+  Recall     = 0.853      (the AI catches ~85% of real failures)
+  Accuracy   = 0.972      (reported for completeness only)
 ```
 
-A test-set **ROC-AUC of 0.9737** indicates that the system correctly ranks an abnormal sample above a normal one approximately 97.4 % of the time — strong threshold-independent evidence that the network's score function encodes genuine diagnostic information rather than relying on a fortuitous decision boundary. The test-set **F1 of 0.875** is comfortably above the 0.0 floor that a degenerate "always Normal" classifier would achieve, confirming that the weighted-loss strategy successfully escaped the Accuracy Paradox.
+Read in plain language: the AI catches roughly **85 out of every 100 broken pumps** in the held-out test set, while raising a false alarm on only about **12 out of every 100 alarms**. An ROC-AUC of 0.97 means that if we picked a healthy and a broken recording at random and asked the AI which was broken, it would get the answer right 97 times out of 100.
 
-#### 5.2.1 Cross-Configuration Test-Set Leaderboard
+#### 5.2.1 The Top Three Configurations
 
-The full HPO grid was re-evaluated on the same held-out test partition for transparency. The validation-selected winning configuration also tops the test-set leaderboard on both F1 and AUC, indicating that validation-set selection generalized faithfully to the test set rather than coincidentally favoring a model that exploits a quirk of the validation fold:
+The winning configuration leads the leaderboard on *both* F1 and AUC simultaneously — a sign that its advantage is not a fluke of where the decision threshold happens to fall, but reflects a genuinely better internal score function:
 
-| Run | LR | BS | BF | Test F1 | Test AUC |
+| Run | LR | BS | BF | F1 | AUC |
 |---|---|---|---|---:|---:|
-| **`run_lr1em03_bs16_bf16`** *(selected)* | 1e-3 | 16 | 16 | **0.8750** | **0.9737** |
-| `run_lr5em04_bs16_bf16` | 5e-4 | 16 | 16 | 0.8154 | 0.9558 |
-| `run_lr5em04_bs16_bf32` | 5e-4 | 16 | 32 | 0.7972 | 0.9712 |
+| **`run_lr5em04_bs64_bf32`** *(champion)* | 0.0005 | 64 | 32 | **0.866** | **0.970** |
+| `run_lr1em03_bs16_bf16` *(prior best at 8-point grid)* | 0.001 | 16 | 16 | 0.830 | 0.951 |
+| `run_lr5em04_bs32_bf16` | 0.0005 | 32 | 16 | 0.791 | 0.960 |
 
-The consistency of the winning configuration across both selection criteria (F1 and AUC) is itself meaningful: a model that wins on F1 but lags on AUC would suggest its lead came from a fortuitous threshold position rather than a fundamentally better score function. Here, the same model leads on both metrics, indicating a substantive — not a coincidental — advantage.
+Crucially, the second-place configuration was the *winner* of an earlier 8-point grid that did not include batch-size = 64. Extending the grid to include the boundary condition is what surfaced the new champion.
 
-### 5.3 Tuning Summary: Robustness of the Architecture
+### 5.3 Robustness of the Architecture and the Smoothness Trap
 
-The complete test-set leaderboard across all eight grid points is summarized below, rank-ordered by F1:
+The complete 12-run leaderboard, ranked by F1, reveals two complementary lessons.
 
-| Rank | Run | LR | BS | BF | Test F1 | Test AUC |
+| Rank | Run | LR | BS | BF | F1 | AUC |
 |:---:|---|---|---|---|---:|---:|
-| 1 | `run_lr1em03_bs16_bf16` | 1e-3 | 16 | 16 | **0.8750** | **0.9737** |
-| 2 | `run_lr5em04_bs16_bf16` | 5e-4 | 16 | 16 | 0.8154 | 0.9558 |
-| 3 | `run_lr5em04_bs16_bf32` | 5e-4 | 16 | 32 | 0.7972 | 0.9712 |
-| 4 | `run_lr5em04_bs32_bf16` | 5e-4 | 32 | 16 | 0.7582 | 0.9540 |
-| 5 | `run_lr1em03_bs16_bf32` | 1e-3 | 16 | 32 | 0.7516 | 0.9662 |
-| 6 | `run_lr5em04_bs32_bf32` | 5e-4 | 32 | 32 | 0.7349 | 0.9679 |
-| 7 | `run_lr1em03_bs32_bf16` | 1e-3 | 32 | 16 | 0.7126 | 0.9621 |
-| 8 | `run_lr1em03_bs32_bf32` | 1e-3 | 32 | 32 | 0.6905 | 0.9602 |
+| 1 | **`run_lr5em04_bs64_bf32`** | 0.0005 | 64 | 32 | **0.866** | **0.970** |
+| 2 | `run_lr1em03_bs16_bf16` | 0.001 | 16 | 16 | 0.830 | 0.951 |
+| 3 | `run_lr5em04_bs32_bf16` | 0.0005 | 32 | 16 | 0.791 | 0.960 |
+| 4 | `run_lr1em03_bs16_bf32` | 0.001 | 16 | 32 | 0.786 | 0.959 |
+| 5 | `run_lr1em03_bs64_bf16` | 0.001 | 64 | 16 | 0.779 | 0.970 |
+| 6 | `run_lr5em04_bs32_bf32` | 0.0005 | 32 | 32 | 0.756 | 0.976 |
+| 7 | `run_lr1em03_bs32_bf16` | 0.001 | 32 | 16 | 0.750 | 0.946 |
+| 8 | `run_lr5em04_bs16_bf32` | 0.0005 | 16 | 32 | 0.749 | 0.968 |
+| 9 | `run_lr1em03_bs64_bf32` | 0.001 | 64 | 32 | 0.745 | 0.950 |
+| 10 | `run_lr5em04_bs16_bf16` | 0.0005 | 16 | 16 | 0.713 | 0.963 |
+| 11 | `run_lr1em03_bs32_bf32` | 0.001 | 32 | 32 | 0.663 | 0.965 |
+| 12 | `run_lr5em04_bs64_bf16` | 0.0005 | 64 | 16 | 0.602 | 0.944 |
 
-The figure [`tuning_summary_graph.png`](docs/Final_tuning_visualizations/tuning_summary_graph.png) renders this leaderboard graphically. **The narrow performance band across configurations is itself a substantive finding.** ROC-AUC remains above **0.95** across *all eight* runs — a total span of just 0.0197 (from 0.9540 to 0.9737) — and F1 ranges from 0.6905 to 0.8750, a spread of approximately 0.18 driven primarily by precision rather than ranking quality. The fact that no single hyperparameter axis dominates the results — and that even the worst configuration retains an AUC above 0.95 — suggests that the **structural decisions made earlier in the pipeline — Global Average Pooling, weighted cross-entropy loss, stratified partitioning — are doing the bulk of the predictive work**, with hyperparameter tuning supplying only marginal refinement. This is exactly the desirable failure mode for an industrial baseline: the system is not brittle to small perturbations of its training configuration. A second observation is also instructive: the bottom three F1 ranks all use `BS = 32`, confirming that the regularizing effect of small-batch gradient noise (§4.4) is responsible for a meaningful slice of the precision gains in the top-ranked runs.
+The figure [`tuning_summary_graph.png`](docs/tuning_visualizations/tuning_summary_graph.png) plots this leaderboard visually.
 
-### 5.4 ROC Curve Cross-Comparison
+#### 5.3.1 The Architecture Itself Is Robust
 
-The figure [`roc_curve_run_lr1em03_bs16_bf16.png`](docs/Final_tuning_visualizations/roc_curve_run_lr1em03_bs16_bf16.png) plots the ROC curve for the winning configuration. Compared against the eight peer ROC curves in [`docs/Final_tuning_visualizations/`](docs/Final_tuning_visualizations/), three patterns emerge:
+Notice the **AUC column**. It never drops below 0.94, even for the worst-performing run. The total spread is only about 0.03, from 0.944 to 0.976. In other words, *every* configuration in the search produces an AI that is fundamentally able to distinguish broken from healthy pumps. The structural choices we made earlier — the spectrogram representation, the weighted loss, the Global Average Pooling — are doing the heavy lifting at the level of *score-distribution quality*. Hyperparameter tuning does not change *what* the AI learns to recognise so much as *how decisively* it commits to that recognition at the default decision threshold.
 
-- **Steep early rise.** The winning curve climbs sharply along the true-positive axis at low false-positive rates, indicating that the model assigns its highest scores almost exclusively to genuine abnormal samples — the operationally critical regime, since industrial alarm thresholds are typically set to suppress false alarms.
-- **Larger AUC gap from the diagonal.** The 0.9737 test-set AUC corresponds visually to a curve that "hugs the top-left corner" of the unit square. Configurations with `BS = 32` exhibit visibly flatter curves in the low-FPR region.
-- **AUC differences are small but visible at low FPR.** The leaderboard AUC range across all eight runs is just 0.0197 (0.9540 to 0.9737), so the ROC curves cluster tightly. The discriminating regime is the *low false-positive corner*: in this slice of the curve, `BS = 16` runs ramp toward Recall = 1.0 measurably faster than their `BS = 32` counterparts, consistent with the leaderboard pattern that the bottom three F1 ranks are all `BS = 32` configurations.
+This is the most desirable failure mode an industrial baseline could have. The system is not brittle to small changes in its training configuration.
 
-The convergence of the winning curve toward the upper-left corner is consistent with the AUC value of 0.9737 and confirms that the model's score function induces a near-monotonic separation between the two classes.
+#### 5.3.2 The Smoothness Trap: Why Big Batches with Aggressive Learning Rates Fail
 
-### 5.5 Confusion Matrix Analysis
+The F1 column tells a different and more interesting story. F1 ranges from **0.866 down to 0.602** — a much wider spread than the AUC range — and it is driven almost entirely by the **interaction between learning rate and batch size**.
 
-The figure [`confusion_matrix_run_lr1em03_bs16_bf16.png`](docs/Final_tuning_visualizations/confusion_matrix_run_lr1em03_bs16_bf16.png) reports the confusion matrix for the validation-selected winning configuration on the held-out **test set** (n = 631 samples; 563 normal, 68 abnormal). Reading it through the FN/FP cost lens established in §1.3:
+Watch what happens when we hold the learning rate at the aggressive value `0.001` and increase the batch size:
+
+| Configuration | F1 | False alarms (approx.) |
+|---|---:|---:|
+| `lr=0.001, bs=16, bf=16` | 0.830 | ~11 |
+| `lr=0.001, bs=64, bf=16` | 0.779 | ~23 |
+| `lr=0.001, bs=64, bf=32` | 0.745 | ~28 |
+
+The F1 score collapses, and the false-alarm count roughly **doubles**. The training trajectory of the bottom-row configuration shows symptoms of severe gradient over-smoothing on the imbalanced dataset — early stopping fires before the AI can fully exploit its parameter budget.
+
+The mechanism is the **Smoothness Trap**:
+
+- A **big batch** (64) produces a *smoothed*, low-noise estimate of the gradient — a confident view of which way to go.
+- An **aggressive learning rate** (0.001) takes *big steps* in that direction.
+- Together: a **big step in a confidently wrong direction** overshoots the narrow regions where the truly best models live. The optimiser ends up settling in a wide, shallow basin that produces a fuzzy, indecisive score function — exactly the configuration that drives precision down and false alarms up.
+
+#### 5.3.3 The Interaction Winner: How a Slow Learning Rate Turns the Trap Inside Out
+
+Now watch what happens at batch size 64 when we *slow down* the learning rate to `0.0005`:
+
+| Configuration | F1 | AUC |
+|---|---:|---:|
+| `lr=0.001, bs=64, bf=32` *(Smoothness Trap)* | 0.745 | 0.950 |
+| `lr=0.0005, bs=64, bf=32` *(Champion)* | **0.866** | **0.970** |
+
+Same large batch. Same wide network. Only the learning rate has changed — and F1 jumps from 0.745 to 0.866. This is the **inverse** of the Smoothness Trap:
+
+- **Big batch (64)** → smoothed, confidently directed gradient.
+- **Slow learning rate (0.0005)** → small, cautious steps in that direction.
+- **Together: small steps in a confidently right direction** → the optimiser descends gradually into a tight, deep minimum that small-batch noise would have prevented it from finding. The wider network (BF = 32) provides the parameter capacity needed to actually fit that minimum.
+
+This is the central scientific finding of the project. **Hyperparameters cannot be selected independently along separate axes**; their optimal values are mutually dependent. A grid search restricted to "reasonable" interior values would have missed this finding entirely. Probing the *boundary* (batch size = 64) revealed it.
+
+#### 5.3.4 A Subordinate Three-Way Interaction
+
+A second, weaker pattern is visible at the bottom of the leaderboard. Look at rank 12 — the worst run in the entire grid:
+
+| Configuration | F1 | False alarms |
+|---|---:|---:|
+| `lr=0.0005, bs=64, bf=16` | 0.602 | ~69 |
+
+Same slow learning rate, same large batch as the champion — but a *narrower* network (BF = 16 instead of 32). The F1 collapses to 0.602 and the false-alarm count rockets to about 69 — roughly **6× more false alarms** than the leaderboard's best small-batch configuration. The smoothed gradient signal that BS = 64 supplies is most productively absorbed by a *wider* parameter space; the narrow BF = 16 network simply lacks the representational capacity to use it, and the imbalanced objective destabilises during training.
+
+The full picture is therefore a *three-way* interaction between learning rate, batch size, and base filters. The grid had to be Cartesian (every combination tested) precisely because no single axis can be tuned in isolation.
+
+### 5.4 The ROC Curve: Looking at the AI's Confidence Across Every Possible Threshold
+
+The figure [`roc_curve_run_lr5em04_bs64_bf32.png`](docs/tuning_visualizations/roc_curve_run_lr5em04_bs64_bf32.png) shows the ROC curve for the champion. To read this plot:
+
+- The **horizontal axis** is the false-alarm rate. Closer to zero = fewer false alarms.
+- The **vertical axis** is the catch rate (Recall). Closer to one = catching more real failures.
+- The **curve itself** sweeps through every possible decision threshold the AI could use. A perfect AI's curve hugs the top-left corner; a random-guess AI's curve runs along the diagonal.
+
+The champion's curve climbs to **about 85% catch rate while the false-alarm rate is still effectively zero** — a near-vertical wall on the left side of the plot. It then plateaus around 97% catch rate before saturating. In plain language, this means we can dial the alarm threshold to be very strict (raising essentially zero false alarms) and still catch 85 out of every 100 real failures. If we relax the threshold a little, we can catch nearly 97 out of 100 — at the cost of letting some false alarms through. **The exact trade-off is a business decision** (see §6.3) that depends on how expensive each kind of error actually is in a particular factory.
+
+### 5.5 The Confusion Matrix: Counting Every Outcome
+
+The figure [`confusion_matrix_run_lr5em04_bs64_bf32.png`](docs/tuning_visualizations/confusion_matrix_run_lr5em04_bs64_bf32.png) is a 2 × 2 table that tabulates every prediction the AI made on the 631 test recordings:
 
 ```
-                           Predicted Normal   Predicted Abnormal
-True Normal      (TN / FP):      559                4              (false alarms)
-True Abnormal    (FN / TP):       12               56              (missed faults are critical)
+                        Predicted Healthy    Predicted Broken
+True Healthy   (n=563):       555                   8           ← 8 false alarms
+True Broken    (n=68):         10                  58           ← 10 missed failures
 ```
 
-The clinical breakdown is striking. Of 563 truly normal samples, the model raises an alarm on only **4** — a false-alarm rate of **0.71 %**. Of 68 truly abnormal samples, the model correctly catches **56**, missing **12** — a recall of **82.4 %**. Of every 60 alarms the system raises, **56 are real** (precision ≈ 93.3 %), so when the model says "fault" an engineer is justified in taking the alarm seriously rather than dismissing it.
+Out of 563 truly healthy pumps, the AI raised a false alarm on only **8**, a false-alarm rate of just **1.4%**. Out of 68 truly broken pumps, the AI correctly caught **58**, a catch rate (Recall) of **85.3%**, missing 10. Of every 66 alarms the system raised, **58 were genuine** (Precision ≈ 87.9%) — when the AI says "fault," the operator is justified in treating it as serious.
 
-This profile reflects the cost structure that the weighted loss was designed to induce: the system is conservative on false alarms (precision is very high) while recovering more than four out of every five true faults at the default decision threshold. The remaining 12 missed faults are the system's principal exposure surface — and exactly the regime that a lower decision threshold (deployable without retraining; see §6) is designed to address. Because the model's threshold-independent ranking quality is high (AUC = 0.9737 on this split), reducing the threshold trades precision for recall along a favorable curve rather than collapsing alarm credibility.
+For comparison, the runner-up configuration (`run_lr1em03_bs16_bf16`) caught two fewer real faults (56 vs 58) *and* raised three more false alarms (11 vs 8). The champion is therefore strictly better on *both* error axes simultaneously — a so-called **Pareto improvement**.
 
-### 5.6 Grad-CAM: Visual Verification of Physical Plausibility
+### 5.6 Grad-CAM: Looking Where the AI Looks
 
-To eliminate "black box" opacity and validate that the network's decisions are grounded in physical signals rather than spurious background artifacts, [`src/explain.py`](src/explain.py) implements **Gradient-weighted Class Activation Mapping (Grad-CAM)**. Hooks attached to the final convolutional layer (`conv4`, exposed via `AudioClassifier.get_final_conv_layer()`) record forward activations $A^k$ and back-propagated gradients $\partial y^c / \partial A^k$. Per-channel importance weights $\alpha_k$ are computed by global-average-pooling the gradients, the activations are linearly combined under those weights, ReLU-clipped, bilinearly upsampled from $(8, 19)$ back to $(128, 313)$, and min-max normalized to produce a heatmap aligned with the original spectrogram axes (Mel-Hz vertical, seconds horizontal).
+Numbers like F1 and AUC tell us *that* the AI works. They do not tell us *why*. For a system intended for industrial deployment, this distinction matters: an engineering team will not trust a black-box decision-maker with safety-critical equipment. They want to verify that the AI is making decisions for the right reasons.
 
-The figures [`gradcam_abnormal_run_lr1em03_bs16_bf16.png`](docs/Final_tuning_visualizations/gradcam_abnormal_run_lr1em03_bs16_bf16.png) and [`gradcam_normal_run_lr1em03_bs16_bf16.png`](docs/Final_tuning_visualizations/gradcam_normal_run_lr1em03_bs16_bf16.png) reveal a clear and physically interpretable contrast between the two classes:
+The technique we use to open the black box is called **Grad-CAM** (Gradient-weighted Class Activation Mapping). The intuition is straightforward. After the AI has classified a recording, we work *backwards* through its internal computations to figure out which regions of the spectrogram contributed most to its decision. The result is a **heatmap** — a coloured overlay on top of the original spectrogram — where bright regions show "the AI was strongly looking here" and dark regions show "the AI ignored here."
 
-- **Abnormal signature.** The Grad-CAM heatmap concentrates intense, *temporally localized* activations in the **mid-frequency Mel band spanning roughly 512 Hz to 2048 Hz**, with the most prominent hotspots visible as discrete vertical bursts at approximately 1.2 s, 4.0 s, and 6.0 s of the 10-second clip. This is precisely the spectral region in which mechanical pump faults — bearing wear, cavitation, impeller distress — produce harmonic energy, and the burst-like temporal structure is consistent with the periodic mechanical impacts that characterize a degraded rotating component. The network has learned to look exactly where a domain expert would look.
-- **Normal signature.** The heatmap exhibits a qualitatively different structure: a **broad, temporally uniform horizontal band of activation centered near 2048 Hz with strong steady-state attention extending above 4096 Hz**. The absence of localized temporal bursts — the activation is essentially time-invariant across the full 10-second window — is the hallmark of a stationary acoustic signal, corresponding to the broadband noise floor of an unimpaired pump operating under nominal conditions. The model is, in effect, classifying "Normal" by recognizing the *absence* of the transient structure that characterizes the Abnormal class.
+The figures [`gradcam_abnormal_run_lr5em04_bs64_bf32.png`](docs/tuning_visualizations/gradcam_abnormal_run_lr5em04_bs64_bf32.png) and [`gradcam_normal_run_lr5em04_bs64_bf32.png`](docs/tuning_visualizations/gradcam_normal_run_lr5em04_bs64_bf32.png) show what the champion was paying attention to on a typical broken-pump and a typical healthy-pump recording, respectively.
 
-The contrast — *localized bursts in mid-frequencies* for abnormal versus *uniform high-frequency steady-state* for normal — accomplishes something that aggregate metrics cannot: it confirms that the model has internalized the **fundamental physics of the machine** rather than over-indexing on background factory noise or label-correlated artifacts. For an engineering team contemplating deployment, this is the credibility test that ROC-AUC alone cannot pass.
+- **Broken pump.** The heatmap concentrates intense activations in the **mid-frequency range, roughly 512 Hz to 2,048 Hz**, with discrete bright bursts at approximately 1.2 seconds, 4.0 seconds, and a particularly intense burst around 6.0 seconds of the 10-second clip. This is exactly where a mechanical engineer would expect to find the harmonic signatures of bearing wear, cavitation, and impeller distress, and the *burst-like* timing pattern is consistent with the periodic mechanical impacts that characterise a degraded rotating component. The AI has learned to look exactly where a domain expert would look.
+- **Healthy pump.** The heatmap looks completely different: a **broad, time-uniform horizontal band** of attention above ~4,096 Hz, with secondary attention near 2,048 Hz. The activations are essentially constant over the full 10 seconds. This is the hallmark of a *stationary* acoustic signal — the broadband noise floor of an undamaged pump operating normally. The AI is, in effect, classifying "Healthy" by recognising the *absence* of the burst-like transient structure that characterises broken pumps.
 
-> **Key Takeaway — Evaluation.** The validation-selected configuration attains a held-out test-set ROC-AUC of **0.9737** and an F1 of **0.875**, catching 56 of 68 true faults while raising only 4 false alarms across 563 normal samples. Grad-CAM confirms that decisions are anchored in mid-frequency Mel bands consistent with mechanical fault harmonics. The narrow performance band across the eight HPO runs demonstrates that the architectural choices — GAP, weighted loss, stratification — provide a robust foundation that hyperparameter selection only modestly refines.
+The contrast — *localised mid-frequency bursts* for broken, *uniform high-frequency hum* for healthy — confirms that the AI has internalised the *physics* of the machine, not some spurious correlation with background factory noise or recording-specific quirks. For an engineering team contemplating real deployment, this is exactly the credibility test that aggregate metrics alone cannot provide.
+
+> **Key Takeaway — Evaluation.** The champion configuration catches 58 of 68 real failures while raising only 8 false alarms across 563 healthy recordings, with a threshold-independent ranking quality of 0.97. The 12-run grid search reveals that this performance arises not from a fragile hyperparameter combination but from an inherent interaction between batch size and learning rate that is only visible at the boundary of the search space. Grad-CAM heatmaps confirm that the AI's decisions are anchored in the same mid-frequency regions that a human mechanical engineer would diagnose by ear.
 
 ---
 
 ## 6. Limitations
 
-While the model is highly effective within the conditions of its training distribution, three primary constraints must be acknowledged before any operational deployment.
+The system works well within the conditions it was trained on. Three caveats must be acknowledged before any real-world deployment.
 
 ### 6.1 Domain Shift
 
-The pipeline is optimized for the MIMII -6dB SNR acoustic environment, which simulates a specific class of factory background noise. Deploying this model to a new factory whose ambient acoustic profile differs materially — for example, a facility with a dominant HVAC signature, different reverberation characteristics, or a different mix of nearby machinery — would likely increase the false-positive rate until the model is **fine-tuned on a small number of samples from the new environment**. This is a familiar problem in transfer learning and is not a defect of the architecture, but it is a deployment cost that downstream stakeholders must internalize.
+The AI was trained on the MIMII dataset's specific acoustic environment: pumps mixed with a particular factory-noise profile at -6 dB SNR. A different factory — one with a dominant air-conditioning hum, different room reverberation, or a different mix of nearby machines — will sound subtly different to the AI, and it will likely raise more false alarms until it is **fine-tuned** on a small number of recordings from the new environment. This is a familiar phenomenon called *domain shift*, and it is not a defect of the architecture, but it is a real deployment cost that any industrial customer must plan for.
 
 ### 6.2 Single-Sensor Reliance
 
-The current pipeline is acoustically univariate: it consumes a single microphone channel and produces a single fault probability. True industrial PdM systems achieve their highest reliability through **sensor fusion** — combining acoustic data with vibration telemetry from accelerometers, thermal imaging, current draw measurements from the motor, and pressure or flow sensors on the fluid path. A multi-modal model would be more robust to acoustic occlusion (e.g., a worker's voice or a passing forklift temporarily masking the pump) and would catch fault categories — such as those producing primarily thermal or vibrational signatures — that are invisible to a microphone.
+The AI listens through a single microphone. Real industrial monitoring systems typically combine *multiple* sensor modalities — vibration measurements from accelerometers, thermal imagery from infrared cameras, motor current measurements, fluid pressure and flow sensors — in a strategy called **sensor fusion**. A multi-modal model would be more robust to acoustic occlusion (a worker's voice or a forklift driving past temporarily masking the pump) and could detect fault categories — like overheating — that are simply invisible to a microphone.
 
-### 6.3 Static Decision Threshold
+### 6.3 The Decision Threshold Is a Business Question, Not a Maths Question
 
-The model produces a continuous probability score, but the binary alarm decision requires a threshold. The ROC-AUC of 0.9737 demonstrates that the score function carries genuine ranking information across the threshold spectrum, but the *specific* operational threshold is not a machine-learning question — it is a **business-logic question**. The threshold must be chosen by weighing:
+The AI produces a continuous confidence score between 0 and 1. To turn that score into a binary "alarm/no alarm" decision, we have to choose a *threshold*. The ROC-AUC of 0.97 confirms that the AI's confidence ranking is informative across the entire threshold range — but choosing the *specific* threshold for deployment is **not** a machine-learning question. It is a business question that depends on:
 
-- The marginal cost of a false alarm (operator time, unnecessary inspection)
-- The marginal cost of a missed fault (downtime, secondary damage, safety risk)
+- The cost of a false alarm (operator time, unnecessary teardown).
+- The cost of a missed failure (downtime, secondary damage, safety risk).
 
-These costs are facility-specific and must be supplied by the asset owner. A reactor pump in a chemical plant warrants an aggressive (low) threshold; a redundant cooling pump in a non-critical loop tolerates a more permissive (higher) threshold. The model exposes the trade-off; the deployer chooses the operating point.
+A reactor pump in a chemical plant warrants an aggressive (low) threshold — even a 1% chance of failure justifies a precautionary inspection. A redundant cooling pump in a non-critical loop tolerates a more relaxed (higher) threshold. The AI exposes the trade-off; the asset owner decides where to set the dial.
 
 ---
 
 ## 7. Future Work
 
-Three avenues of follow-up work would meaningfully extend the system's statistical rigor, robustness, and deployability.
+Three avenues of follow-up work would meaningfully improve the system's statistical rigour, robustness, and deployability.
 
 ### 7.1 K-Fold Cross-Validation
 
-The current 70/15/15 partition with a fixed random seed produces a **point estimate** of generalization performance — informative, but a single sample of the underlying performance distribution. Future iterations should adopt **K-fold cross-validation** (e.g., $K = 5$ stratified folds), reporting the mean and standard deviation of F1 and AUC across folds. This converts the headline numbers from point estimates into confidence intervals and definitively rules out the possibility that the high reported performance was the artifact of a fortunate random seed. Combined with statistical hypothesis testing across folds, K-fold CV would also enable formal claims of significance when comparing the eight grid configurations.
+The current 70/15/15 split, with a fixed random seed, produces a **point estimate** of how well the system generalises — informative, but a single sample of the underlying performance distribution. **K-fold cross-validation** (typically with K = 5) would split the data into 5 different train/test partitions and report the *average* and *spread* of performance across all of them. This converts a single number ("F1 = 0.866") into a confidence interval ("F1 = 0.85 ± 0.03"), and definitively rules out the possibility that the strong reported numbers were an artefact of one fortunate split. Combined with statistical hypothesis testing, K-fold CV would also let us formally claim that the champion is significantly better than the runner-up — at present, the gap of 0.04 F1 is suggestive but not yet proven against random variation.
 
 ### 7.2 Acoustic Data Augmentation (SpecAugment)
 
-The minority class is under-represented by an order of magnitude, and weighted loss only partially compensates. **SpecAugment** — randomly masking contiguous frequency bands and time steps within the spectrogram during training — would artificially expand the effective abnormal-class training set and force the network to learn *multiple, redundant* acoustic signatures per fault category rather than a single high-confidence pattern. This would directly address the residual recall ceiling at the default threshold (12 of 68 abnormal samples missed, Recall ≈ 0.82) by improving robustness to partial signal occlusion, which is exactly the failure mode that the noisy -6dB SNR environment produces.
+The minority class is under-represented by an order of magnitude, and weighted loss only partially compensates. **SpecAugment** is a technique that generates *additional* training variations by randomly masking horizontal stripes (frequency bands) and vertical stripes (time slices) of each spectrogram during training. The effect is to force the AI to learn *redundant* signatures of each fault category — multiple ways of identifying a broken pump — rather than relying on a single high-confidence pattern. This would directly address the residual recall ceiling of 85% (10 of 68 broken pumps still missed) by making the AI more robust to partial signal occlusion, which is exactly the failure mode that the noisy -6 dB factory environment produces.
 
-### 7.3 Edge Deployment via Quantization (TinyML)
+### 7.3 Edge Deployment via Quantisation (TinyML)
 
-The system's 97,890-parameter footprint is already small by modern deep-learning standards, but a full-fidelity FP32 inference path still requires a Python runtime, PyTorch, and several hundred MB of supporting libraries — impractical on a low-power microcontroller mounted at the pump. **Post-training quantization** from 32-bit floating-point to 8-bit integer representation would reduce the model's weight footprint by ~4× and replace floating-point matrix multiplications with integer arithmetic, enabling deployment to ARM Cortex-M class devices via TensorFlow Lite Micro or PyTorch Edge. This transforms the system from an off-line analysis tool into a **continuous, on-device monitor** capable of running directly on the factory floor, eliminating network round-trips and the associated reliability dependencies.
+The full-fidelity AI runs in Python with PyTorch, requiring several hundred megabytes of supporting libraries — impractical for a tiny battery-powered microcontroller mounted directly on a pump. **Quantisation** is the process of converting the AI's internal numbers from 32-bit floating-point representation (high precision, fat memory footprint) to 8-bit integer representation (lower precision, ~4× smaller, much faster on cheap hardware). The resulting model can run on an ARM Cortex-M class microcontroller, transforming the system from an off-line analysis tool into a **continuous, on-device monitor**: a small box bolted to the pump itself, listening 24/7, raising alarms in real time without ever touching the network.
 
 ---
 
-## 8. Conclusions
+## 8. Conclusion
 
-This project documents the evolution of an industrial predictive-maintenance pipeline from a fragile, memory-bound prototype into a parameter-efficient, statistically rigorous, and explainable system. Three engineering decisions account for the majority of the final system's quality:
+This project tells the story of an AI system that learns to listen for impending mechanical failure in industrial pumps — and the engineering choices that turned that idea into a working tool.
 
-1. **Class imbalance was confronted at the loss function**, not papered over with synthetic oversampling. Inverse-frequency weighted cross-entropy injects an 8.2× cost ratio that aligns the model's optimization objective with the FN/FP cost asymmetry that defines the industrial domain.
-2. **Overfitting was eliminated structurally** by replacing a 2.5M-parameter dense classification head with `nn.AdaptiveAvgPool2d(1)`, reducing the model to 97,890 parameters and forcing the network to learn channel-level rather than positional features.
-3. **The optimum was located systematically** through a `subprocess`-isolated Cartesian grid search that side-stepped the GPU memory inflation, crash propagation, and reproducibility hazards endemic to in-process hyperparameter loops.
+Four decisions account for most of the final system's quality:
 
-The validation-selected configuration (LR=1e-3, BS=16, BF=16) achieves a held-out test-set ROC-AUC of **0.9737** and an F1 of **0.875**, catching 56 of 68 true faults at a false-alarm rate of just 0.71 %, with Grad-CAM heatmaps confirming that the network's decisions are anchored in mid-frequency Mel bands consistent with the physical signatures of mechanical fault. The narrow performance band across all eight HPO runs further indicates that this performance is attributable not to a fortunate hyperparameter choice but to the underlying architectural decisions, suggesting the system is genuinely robust rather than narrowly tuned.
+1. **Class imbalance was confronted head-on** with a weighted loss function that makes missing a real failure roughly 8× more costly to the AI than raising a false alarm. We deliberately avoided synthetic over-sampling, which would have manufactured fake failures the AI would have learned to recognise but a real factory never produces.
+2. **Overfitting was eliminated structurally** by replacing the conventional Flatten-then-classify head with a Global Average Pooling layer, slashing the parameter count by 95% and forcing the AI to learn position-invariant patterns rather than memorising individual training clips.
+3. **The optimum was located systematically** through a 12-point Cartesian grid search, with each run isolated in its own operating-system subprocess to eliminate GPU-memory leaks, crash propagation, and reproducibility bugs.
+4. **The grid was extended to a boundary condition** — batch size = 64 — which exposed an unexpected interaction effect that an interior-only search would have missed. The *Smoothness Trap* (large batch + aggressive learning rate = overshoot) and its inverse (large batch + slow learning rate + wide network = optimum) were invisible until the grid was extended; once visible, they redrew the deployable model.
 
-The final deliverable is therefore not merely a classifier but an **explainable AI tool** — one that bridges raw acoustic signal processing, principled treatment of class imbalance, and the visual transparency required for an engineering team to trust an automated fault detector with the asset-protection responsibilities that motivated the project in the first place.
+The final system catches **58 of 68 truly broken pumps** in a held-out test set, raising only **8 false alarms across 563 healthy recordings** — and Grad-CAM heatmaps confirm that it is doing so by paying attention to the same mid-frequency acoustic signatures that a mechanical engineer would diagnose by ear.
+
+The methodological lesson generalises beyond this dataset. When a hyperparameter grid is restricted to "reasonable" interior values, the search will converge to whichever interior configuration best balances regularisation and capacity — but it cannot characterise how those properties interact at the *boundaries*. Pushing the grid to a boundary value cost almost nothing computationally, and uncovered the configuration that became the deployable system. **Boundary-condition probes deserve to be a standard part of every hyperparameter search.**
+
+The final deliverable is therefore not just a classifier. It is an **explainable AI tool** — one that bridges raw acoustic signal processing, principled treatment of class imbalance, systematic ablation across boundary conditions, and the visual transparency required for an engineering team to trust it with the asset-protection responsibilities that motivated the project in the first place.
 
 ---
 
@@ -387,21 +512,46 @@ The final deliverable is therefore not merely a classifier but an **explainable 
 Predictive-Maintenance-Audio-CNN/
 ├── src/
 │   ├── preprocess.py    # Audio → Log-Mel-Spectrogram conversion
-│   ├── dataset.py       # SpectrogramDataset (lazy loading), class weights, splits
-│   ├── model.py         # AudioClassifier (4-block CNN with GAP head)
-│   ├── train.py         # Adam + weighted CE + ReduceLROnPlateau + early stopping
-│   ├── evaluate.py      # F1 / ROC-AUC / confusion matrix, CSV result tracking
-│   └── explain.py       # Grad-CAM visualization
+│   ├── dataset.py       # Lazy-loading dataset, class weights, train/val/test splits
+│   ├── model.py         # The 4-block CNN with Global Average Pooling head
+│   ├── train.py         # Training loop, weighted loss, automatic safety nets
+│   ├── evaluate.py      # F1, ROC-AUC, confusion matrix, per-run logging
+│   └── explain.py       # Grad-CAM heatmap generation
 ├── tests/
-│   ├── conftest.py      # sys.path injection for src/ imports
+│   ├── conftest.py      # Imports plumbing
 │   ├── test_preprocess.py
 │   ├── test_dataset.py
 │   └── test_model.py
-├── tune.py              # Cartesian grid search via subprocess.run
+├── tune.py              # 12-point Cartesian grid search via OS subprocess
 └── docs/
-    └── Final_tuning_visualizations/   # 37 PNG figures + experiment_tracking CSVs
+    ├── experiment_tracking.csv             # Per-run metrics for all 12 configurations
+    └── tuning_visualizations/              # ROC curves, confusion matrices, Grad-CAM heatmaps
 ```
 
+## Appendix B: Glossary of Plain-English Definitions
 
-
-
+| Technical term | Plain-English definition |
+|---|---|
+| **Spectrogram** | A "visual fingerprint" of sound: a 2-D image where time runs left-to-right, pitch runs bottom-to-top, and brightness shows loudness. |
+| **Mel scale** | A non-linear pitch axis that mimics human hearing. Gives more vertical resolution to low frequencies (where mechanical faults live) than to high frequencies. |
+| **Decibel (dB)** | A logarithmic measure of loudness. Compresses huge ranges of sound power into manageable numbers. |
+| **CNN (Convolutional Neural Network)** | A type of AI originally designed to recognise patterns in images. Treats each spectrogram as a single-channel grayscale picture. |
+| **Parameter / weight** | An internal adjustable number inside the AI. More parameters = more capacity = greater risk of memorisation rather than learning. |
+| **Hyperparameter** | A dial set *before* training begins (e.g. learning rate). Hyperparameters control *how* the AI learns, not what it learns. |
+| **Loss function** | The AI's "report card" — a number that measures how wrong each prediction was. The AI learns by trying to make this number smaller. |
+| **Weighted loss** | A loss function that punishes mistakes on the rare class more harshly than mistakes on the common class. |
+| **Epoch** | One complete pass through every example in the training set. |
+| **Batch size** | How many examples the AI looks at before doing one round of self-correction. |
+| **Learning rate** | How big a step the AI takes when it self-corrects. |
+| **Overfitting** | When an AI memorises its training examples instead of learning generalisable patterns. The textbook example of an AI that aces practice tests but fails the real exam. |
+| **Global Average Pooling (GAP)** | A specific structural change to the AI that removes its ability to encode *where* a pattern fired, only *how strongly*. Acts as a powerful built-in regulariser. |
+| **Recall** | Of all the genuinely broken pumps, what fraction did the AI catch? |
+| **Precision** | When the AI raised an alarm, how often was it justified? |
+| **F1-Score** | A balanced combination of Precision and Recall. High when both are high. |
+| **ROC-AUC** | A threshold-independent score: the probability that the AI gives a randomly chosen broken pump a higher confidence than a randomly chosen healthy pump. |
+| **Confusion matrix** | A 2 × 2 table showing all four outcomes: true positives, false positives, true negatives, false negatives. |
+| **Grad-CAM** | A heatmap that shows where on the spectrogram the AI was looking when it made a particular decision — a window into the AI's reasoning. |
+| **Subprocess** | A separate program launched by the main program. Used here to give each grid-search run a clean GPU memory state. |
+| **Stratified split** | A way of dividing data into subsets that preserves the class proportions in every subset. |
+| **Domain shift** | The phenomenon where an AI trained in one environment performs worse in a slightly different one. |
+| **Quantisation** | Converting the AI's internal numbers from 32-bit (high-precision, big) to 8-bit (lower-precision, small), so the AI can run on tiny low-power hardware. |

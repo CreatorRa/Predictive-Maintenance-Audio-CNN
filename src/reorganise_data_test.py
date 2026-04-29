@@ -1,4 +1,8 @@
-import shutil
+'''This script is commented out to prevent accidental execution. The script is a test to process files for quick verification before running on the entire dataset.
+It is designed to pool audio files from a structured directory of pump data into two master folders: "Normal (Master)" and "Abnormal (Master)".
+Each file is renamed to include its original pump ID for traceability. '''
+
+'''import shutil
 from pathlib import Path
 
 def pool_pump_data(source_dir: str, target_dir: str, test_mode: bool = False, test_limit: int = 4):
@@ -59,3 +63,5 @@ if __name__ == "__main__":
     TEST_MODE = True 
     
     pool_pump_data(RAW_DATA_DIR, MASTER_DATA_DIR, test_mode=TEST_MODE)
+
+'''
