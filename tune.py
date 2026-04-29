@@ -92,7 +92,7 @@ import time              # Per-run timing so we can budget Colab credits
 #     doubles per-epoch training time.
 HYPERPARAMETER_GRID = {
     "lr":           [1e-3, 5e-4],
-    "batch_size":   [16, 32],
+    "batch_size":   [16, 32, 64],
     "base_filters": [16, 32],
 }
 
