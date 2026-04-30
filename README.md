@@ -1,30 +1,18 @@
-# Predictive-Maintenance-Audio-CNN
-A deep learning model that detects anomalies in industrial machinery using audio data
+# Predictive Maintenance (PdM) with Deep Learning
 
-Here is a complete, professional `README.md` formatted specifically for your GitHub repository. It includes the project overview, the Zenodo data link, repository structure, and the exact step-by-step instructions for both Google Colab and Local Terminal execution. 
-
-I also added a **`requirements.txt`** section at the bottom, which is strictly necessary for anyone else to run your code without getting import errors.
-
-***
-
-Copy the markdown text below and save it as `README.md` in the root folder of your repository:
-
-```markdown
-# Acoustic Predictive Maintenance (PdM) with Deep Learning 🏭🎧
+This repository provides a robust, end-to-end Deep Learning pipeline for Acoustic Predictive Maintenance (PdM). By framing mechanical degradation as a spatial pattern recognition problem, this project utilizes a Convolutional Neural Network (CNN) to detect impending pump failures from Log-Mel-Spectrograms. The architecture is explicitly engineered to overcome the two primary challenges of industrial acoustic data: severe minority class imbalance (~11% anomaly rate) and extreme background interference (-6dB Signal-to-Noise Ratio).
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=flat&logo=PyTorch&logoColor=white)](https://pytorch.org/)
 
-This repository contains a Deep Learning pipeline for **Acoustic Predictive Maintenance (PdM)** on industrial pump systems. It uses a 4-block Convolutional Neural Network (CNN) with a Global Average Pooling (GAP) head to classify machinery as "Normal" or "Abnormal" by listening to its operational sound.
-
-### 🌟 Project Highlights
+###  Project Highlights
 * **The Challenge:** Detecting mechanical faults in a worst-case scenario: heavy factory background noise (-6dB SNR) and a severe ~11% class imbalance (faults are rare).
 * **The Approach:** Raw audio is converted into 2D Log-Mel-Spectrograms. To prevent overfitting, a massive 2.5-million-parameter dense head was replaced with a **Global Average Pooling (GAP)** layer, shrinking the model to ~97k parameters and acting as a structural regularizer.
 * **The Results:** Through a robust 12-point Cartesian Grid Search over Learning Rate, Batch Size, and Base Filters, the champion model (`LR=5e-4, BS=64, BF=32`) achieved a **held-out Test F1-Score of 0.866** and an **ROC-AUC of 0.9703**.
 
 ---
 
-## 📂 Repository Structure
+##  Repository Structure
 ```text
 Predictive-Maintenance-Audio-CNN/
 ├── src/
@@ -126,10 +114,6 @@ This project includes a suite of unit tests to prevent silent regressions (e.g.,
 pytest tests/
 ```
 
-```
-
-***
-
 ### One Extra Thing You Need for Your Repository:
 
 For people to clone your repository and run it, you **must** include a `requirements.txt` file in your root folder. Create a new file named `requirements.txt` and paste this into it (these are the standard libraries you've been using based on our conversation):
@@ -145,5 +129,5 @@ matplotlib>=3.7.0
 seaborn>=0.12.0
 pytest>=7.0.0
 ```
-
-With this `README.md` and `requirements.txt` added to your repository, anyone in the world (including recruiters, professors, or other students) will be able to look at your code, understand the deep economic and machine learning logic behind it, and run it on their own machines instantly!
+## Disclaimer 
+This pipeline was developed and rigorously evaluated as an academic, scientific proof-of-concept using the MIMII dataset under simulated factory noise conditions (-6dB SNR). It is not intended for immediate plug-and-play deployment in a live, mission-critical industrial environment. Every factory has a unique acoustic profile; deploying this model in a new facility will require fine-tuning to account for Domain Shift (different room reverberations, distinct background machinery, etc.). This software should be used for research and educational purposes, and should never replace multi-sensor safety systems or professional engineering judgment.
