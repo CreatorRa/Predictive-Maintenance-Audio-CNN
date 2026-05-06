@@ -47,7 +47,7 @@ This project uses the **MIMII (Malfunctioning Industrial Machines Investigation 
 
 ---
 
-## How to Run the Code
+# How to Run the Code
 
 You can run this project locally in your terminal or entirely in the cloud using Google Colab. 
 
@@ -73,7 +73,32 @@ Google Colab provides free GPU access, which is highly recommended for running t
    !wget [https://zenodo.org/record/3384388/files/-6_dB_pump.zip](https://zenodo.org/record/3384388/files/-6_dB_pump.zip) -P data/raw/
    !unzip -q data/raw/-6_dB_pump.zip -d data/raw/
    ```
-7. Fire the engines! Run the full hyperparameter grid search:
+## Warning
+Before moving on to running the scripts you will have to develop your own solution to reorganising the data yourself. The source files contain my solution that I developed to reorganise the data, so that it can be easily sorted into two folders. Take a look at:
+``` bash
+!python reorganise_data_full.py 
+```
+to see how my solution. 
+
+It is advised that depending on the solution you develop that you run a smoke test in conjunction with: 
+
+```bash
+!python preprocess.py
+```
+included in src folder is my smoke test version of the file restructuing the data. 
+
+Once you have developed a solution, either your own or implemented my solution, you can run
+
+7. Generate the Spectrograms:
+   ```bash
+   !python preprocess.py
+   ```
+   Alternatively, you can simply run the pipline file to just get the baseline results:
+   ``` bash 
+   !python run_pipeline.py
+   ```
+### Hyper-parameter optimisations
+8. Run the full hyperparameter grid search:
    ```bash
    !python tune.py
    ```
@@ -101,11 +126,22 @@ If you have a local GPU or just want to run inference on your CPU, you can run t
    pip install -r requirements.txt
    ```
 4. **Ensure your data is in place:** Verify you have downloaded the MIMII pump dataset from the Zenodo link above and extracted it into the `data/raw/` folder.
-5. **Run the grid search / training loop:**
-   ```bash
-   python tune.py
-   ```
 
+## Warning
+Before moving on to running the scripts you will have to develop your own solution to reorganising the data yourself. The source files contain my solution that I developed to reorganise the data, so that it can be easily sorted into two folders. Take a look at `reorganise_data_full.py`
+to see how my solution. 
+
+It is advised that depending on the solution you develop that you run a smoke test in conjunction with `preprocess.py`. Included in src folder is my smoke test version of the file restructuing the data (`reorgnise_data_test.py`) 
+
+Once you have developed a solution, either your own or implemented my solution, you can run
+5. **Run the pipeline**
+``` bash
+  python run_pipeline.py
+```
+6. **Run the grid searh:**
+```bash
+  python tune.py
+```
 ---
 
 ## Running the Test Suite
