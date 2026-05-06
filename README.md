@@ -74,7 +74,7 @@ Google Colab provides free GPU access, which is highly recommended for running t
    !unzip -q data/raw/-6_dB_pump.zip -d data/raw/
    ```
 ## Warning
-Before moving on to running the scripts you will have to develop your own solution to reorganising the data yourself. The source files contain my solution that I developed to reorganise the data, so that it can be easily sorted into two folders. Take a look at:
+Before moving on to running the scripts you will have to develop your own solution to reorganising the data yourself. The source files contains my solution that I developed to reorganise the data, so that it can be easily sorted into two folders. Take a look at:
 ``` bash
 !python reorganise_data_full.py 
 ```
@@ -134,6 +134,7 @@ to see how my solution.
 It is advised that depending on the solution you develop that you run a smoke test in conjunction with `preprocess.py`. Included in src folder is my smoke test version of the file restructuing the data (`reorgnise_data_test.py`) 
 
 Once you have developed a solution, either your own or implemented my solution, you can run
+
 5. **Run the pipeline**
 ``` bash
   python run_pipeline.py
